@@ -1,0 +1,61 @@
+{
+  "name": "@loliuy/opcua-client",
+  "version": "0.1.0",
+  "description": "High-scale OPC UA client nodes for Node-RED powered by open62541",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/loliuy/opcua-client.git"
+  },
+  "main": "index.js",
+  "gypfile": true,
+  "files": [
+    "binding.gyp",
+    "index.js",
+    "lib",
+    "nodes",
+    "src",
+    "scripts",
+    "README.md",
+    "BENCHMARK.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "install": "npm run build:open62541 && node-gyp rebuild",
+    "build:open62541": "bash scripts/build-open62541.sh",
+    "build": "node-gyp rebuild",
+    "clean": "node-gyp clean",
+    "test": "node --test test/*.test.js",
+    "test:native": "node test/native.integration.js && node test/native.queue.integration.js && node test/reconnect.integration.js",
+    "test:reconnect": "node test/reconnect.integration.js",
+    "test:stress": "node test/stress.js",
+    "test:nodered": "node test/nodered.integration.js",
+    "test:nodered:reconnect": "OPCUA_NODERED_RECONNECT=1 node test/nodered.integration.js"
+  },
+  "keywords": [
+    "node-red",
+    "opcua",
+    "opc-ua",
+    "open62541",
+    "industrial-iot"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "node-red": {
+    "version": ">=3.1",
+    "nodes": {
+      "tier0-opcua-connection": "nodes/connection.js",
+      "tier0-opcua-browse": "nodes/browse.js",
+      "tier0-opcua-read": "nodes/read.js",
+      "tier0-opcua-write": "nodes/write.js",
+      "tier0-opcua-subscribe": "nodes/subscribe.js"
+    }
+  },
+  "dependencies": {
+    "node-addon-api": "^8.3.1"
+  },
+  "devDependencies": {
+    "node-gyp": "^11.4.2"
+  }
+}

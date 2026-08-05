@@ -1,0 +1,44 @@
+<style>
+  .opcua-advanced { margin: 8px 0 12px; }
+  .opcua-advanced summary { cursor: pointer; font-weight: 600; padding: 6px 0; }
+  .opcua-standard-note { margin: 0 0 10px 105px; color: var(--red-ui-form-text-color, #666); font-size: 0.9em; }
+</style>
+<script type="text/html" data-template-name="tier0-opcua-subscribe">
+  <div class="form-row"><label for="node-input-connection">Connection</label><input type="text" id="node-input-connection"></div>
+  <div class="form-row"><label for="node-input-nodeId">NodeId</label><input type="text" id="node-input-nodeId" placeholder="Optional when input supplies points"></div>
+  <div class="form-row"><label for="node-input-samplingInterval">Sampling (ms)</label><input type="number" id="node-input-samplingInterval"></div>
+  <div class="opcua-standard-note">Standard mode batches changes and automatically rebuilds the subscription after reconnect.</div>
+  <details class="opcua-advanced">
+    <summary>Advanced subscription and queue settings</summary>
+    <div class="form-row"><label for="node-input-publishingInterval">Publishing interval</label><input type="number" id="node-input-publishingInterval"></div>
+    <div class="form-row"><label for="node-input-queueSize">Server queue size</label><input type="number" id="node-input-queueSize"></div>
+    <div class="form-row"><label for="node-input-discardOldest">Discard oldest</label><input type="checkbox" id="node-input-discardOldest" style="width:auto"></div>
+    <div class="form-row"><label for="node-input-deadbandType">Deadband</label><select id="node-input-deadbandType"><option value="none">None</option><option value="absolute">Absolute</option><option value="percent">Percent</option></select></div>
+    <div class="form-row"><label for="node-input-deadbandValue">Deadband value</label><input type="number" id="node-input-deadbandValue"></div>
+    <div class="form-row"><label for="node-input-batchSize">Create batch size</label><input type="number" id="node-input-batchSize"></div>
+    <div class="form-row"><label for="node-input-outputMode">Change output</label><select id="node-input-outputMode"><option value="batch">Native batch</option><option value="single">One message per change</option></select></div>
+    <div class="form-row"><label for="node-input-callbackBatchSize">Native batch size</label><input type="number" id="node-input-callbackBatchSize"></div>
+    <div class="form-row"><label for="node-input-callbackQueueSize">Native queue capacity</label><input type="number" id="node-input-callbackQueueSize"></div>
+    <div class="form-row"><label for="node-input-queueMode">Queue mode</label><select id="node-input-queueMode"><option value="all">All changes</option><option value="latest">Latest value per point</option></select></div>
+    <div class="form-row"><label for="node-input-overflowPolicy">Overflow policy</label><select id="node-input-overflowPolicy"><option value="drop-oldest">Drop oldest</option><option value="drop-newest">Drop newest</option></select></div>
+  </details>
+  <div class="form-row"><label for="node-input-name">Name</label><input type="text" id="node-input-name"></div>
+</script>
+<script type="text/html" data-help-name="tier0-opcua-subscribe"><p>Creates one OPC UA subscription with many monitored items. Input may be an array, JSON, CSV, or Browse output. Commands are <code>replace</code>, <code>add</code>, <code>remove</code>, and <code>clear</code> in <code>msg.opcua.command</code>.</p><p>Standard mode preserves all changes in bounded native batches and reports queue diagnostics in <code>msg.opcua.queue</code>.</p></script>
+<script type="text/javascript">
+  RED.nodes.registerType('tier0-opcua-subscribe', {
+    category: 'OPC UA', color: '#c7e9f1', inputs: 1, outputs: 1, icon: 'bridge.png',
+    defaults: {
+      connection: { value: '', type: 'tier0-opcua-connection', required: true }, nodeId: { value: '' },
+      publishingInterval: { value: 1000, validate: RED.validators.number() }, samplingInterval: { value: 1000, validate: RED.validators.number() },
+      queueSize: { value: 10, validate: RED.validators.number() }, discardOldest: { value: true },
+      deadbandType: { value: 'none' }, deadbandValue: { value: 0, validate: RED.validators.number() },
+      batchSize: { value: 500, validate: RED.validators.number() }, outputMode: { value: 'batch' },
+      callbackBatchSize: { value: 500, validate: RED.validators.number() }, callbackQueueSize: { value: 10000, validate: RED.validators.number() },
+      queueMode: { value: 'all' }, overflowPolicy: { value: 'drop-oldest' },
+      lifetimeCount: { value: 120 }, maxKeepAliveCount: { value: 10 }, maxNotificationsPerPublish: { value: 0 },
+      reconnectInterval: { value: 5000 }, name: { value: '' }
+    },
+    label: function () { return this.name || 'tier0-opcua-subscribe'; }
+  });
+</script>

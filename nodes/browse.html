@@ -1,0 +1,258 @@
+<style>
+  .opcua-advanced { margin: 8px 0 12px; }
+  .opcua-advanced summary { cursor: pointer; font-weight: 600; padding: 6px 0; }
+  .opcua-tree-tools { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+  .opcua-tree-search { width: 100% !important; margin-bottom: 6px !important; }
+  .opcua-tree-status { color: var(--red-ui-form-text-color, #666); font-size: 0.9em; min-height: 20px; }
+  .opcua-tree { height: 360px; overflow: auto; border: 1px solid var(--red-ui-form-input-border-color, #ccc); border-radius: 3px; padding: 5px; background: var(--red-ui-form-input-background, #fff); }
+  .opcua-tree ul { list-style: none; margin: 0; padding-left: 20px; }
+  .opcua-tree > ul { padding-left: 0; }
+  .opcua-tree-row { display: flex; align-items: center; min-height: 25px; white-space: nowrap; }
+  .opcua-tree-toggle { width: 20px; min-width: 20px; padding: 0; border: 0; background: transparent; color: inherit; }
+  .opcua-tree-toggle.is-leaf { visibility: hidden; }
+  .opcua-tree-check { width: auto !important; margin: 0 6px 0 0 !important; }
+  .opcua-tree-label { overflow: hidden; text-overflow: ellipsis; }
+  .opcua-tree-class { margin-left: 6px; color: #888; font-size: 0.85em; }
+</style>
+<script type="text/html" data-template-name="tier0-opcua-browse">
+  <div class="form-row"><label for="node-input-connection">Connection</label><input type="text" id="node-input-connection"></div>
+  <div class="form-row"><label for="node-input-rootNodeId">Root NodeId</label><input type="text" id="node-input-rootNodeId" placeholder="ns=0;i=85"></div>
+  <div class="form-row">
+    <label style="vertical-align:top">Node tree</label>
+    <div style="display:inline-block;width:70%">
+      <div class="opcua-tree-tools">
+        <button type="button" class="red-ui-button" id="node-input-loadTree"><i class="fa fa-search"></i> Load tree</button>
+        <button type="button" class="red-ui-button" id="node-input-selectAll"><i class="fa fa-check-square-o"></i> Select all</button>
+        <button type="button" class="red-ui-button" id="node-input-clearSelection"><i class="fa fa-square-o"></i> Clear</button>
+      </div>
+      <input type="text" class="opcua-tree-search" id="node-input-treeSearch" placeholder="Filter by name, path, or NodeId">
+      <div class="opcua-tree-status" id="node-input-treeStatus"></div>
+      <div class="opcua-tree" id="node-input-tree"><div class="opcua-tree-status">Load the deployed connection to browse and select variables.</div></div>
+    </div>
+  </div>
+  <details class="opcua-advanced">
+    <summary>Advanced browse settings</summary>
+    <div class="form-row"><label for="node-input-recursive">Recursive</label><input type="checkbox" id="node-input-recursive" style="width:auto"></div>
+    <div class="form-row"><label for="node-input-variablesOnly">Variables only</label><input type="checkbox" id="node-input-variablesOnly" style="width:auto"></div>
+    <div class="form-row"><label for="node-input-maxDepth">Maximum depth</label><input type="number" id="node-input-maxDepth"></div>
+    <div class="form-row"><label for="node-input-maxNodes">Maximum nodes</label><input type="number" id="node-input-maxNodes"></div>
+    <div class="form-row"><label for="node-input-attributeBatchSize">Attribute batch</label><input type="number" id="node-input-attributeBatchSize"></div>
+    <div class="form-row"><label for="node-input-outputMode">Output</label><select id="node-input-outputMode"><option value="all">All selected points</option><option value="paged">Paged selected points</option></select></div>
+    <div class="form-row"><label for="node-input-pageSize">Page size</label><input type="number" id="node-input-pageSize"></div>
+  </details>
+  <div class="form-row"><label for="node-input-name">Name</label><input type="text" id="node-input-name"></div>
+</script>
+<script type="text/html" data-help-name="tier0-opcua-browse">
+  <p>Loads the deployed OPC UA connection as a checkbox tree. Checking a parent selects every variable below it. Clearing a child makes its ancestors partially selected.</p>
+  <p>On input the node outputs every saved checked variable, ready for Read or Subscribe. Send <code>msg.opcua.liveBrowse=true</code> to bypass the saved selection and browse live.</p>
+</script>
+<script type="text/javascript">
+  RED.nodes.registerType('tier0-opcua-browse', {
+    category: 'OPC UA', color: '#c7e9f1', inputs: 1, outputs: 1, icon: 'search.png',
+    defaults: {
+      connection: { value: '', type: 'tier0-opcua-connection', required: true }, rootNodeId: { value: 'ns=0;i=85' },
+      selectedNodes: { value: [] }, recursive: { value: true }, variablesOnly: { value: true },
+      maxDepth: { value: 10, validate: RED.validators.number() }, maxNodes: { value: 10000, validate: RED.validators.number() },
+      attributeBatchSize: { value: 200, validate: RED.validators.number() }, outputMode: { value: 'all' },
+      pageSize: { value: 500, validate: RED.validators.number() }, name: { value: '' }
+    },
+    oneditprepare: function () {
+      const self = this;
+      let treeRoot = null;
+      let treeLoaded = false;
+      let selectedIds = new Set((self.selectedNodes || []).map((item) => item.nodeId));
+      let selectedDescriptors = new Map((self.selectedNodes || []).map((item) => [item.nodeId, item]));
+      const treeArea = $('#node-input-tree');
+      const statusArea = $('#node-input-treeStatus');
+      const loadButton = $('#node-input-loadTree');
+      const loadIcon = loadButton.children('i');
+
+      function adminUrl() {
+        const api = RED.settings && RED.settings.apiRootUrl;
+        if (api) return String(api).replace(/\/?$/, '/') + 'opcua-client/browse';
+        const root = RED.settings && RED.settings.httpAdminRoot;
+        if (root && String(root) !== '/') return String(root).replace(/\/+$/, '') + '/opcua-client/browse';
+        const path = String(window.location.pathname || '').replace(/\/+$/, '');
+        return (path && path !== '/' ? path : '') + '/opcua-client/browse';
+      }
+
+      function descriptor(node) {
+        const item = { ...node };
+        delete item.children;
+        delete item._checkbox;
+        delete item._childrenElement;
+        delete item._listItem;
+        return item;
+      }
+
+      function walk(node, action) {
+        action(node);
+        (node.children || []).forEach((child) => walk(child, action));
+      }
+
+      function setSubtree(node, checked) {
+        walk(node, (current) => {
+          if (current.nodeClass !== 'Variable') return;
+          if (checked) {
+            selectedIds.add(current.nodeId);
+            selectedDescriptors.set(current.nodeId, descriptor(current));
+          } else {
+            selectedIds.delete(current.nodeId);
+            selectedDescriptors.delete(current.nodeId);
+          }
+        });
+      }
+
+      function updateChecks(node) {
+        let total = node.nodeClass === 'Variable' ? 1 : 0;
+        let selected = node.nodeClass === 'Variable' && selectedIds.has(node.nodeId) ? 1 : 0;
+        (node.children || []).forEach((child) => {
+          const childState = updateChecks(child);
+          total += childState.total;
+          selected += childState.selected;
+        });
+        if (node._checkbox) {
+          const checked = total > 0 && selected === total;
+          const indeterminate = selected > 0 && selected < total;
+          node._checkbox.prop('disabled', total === 0);
+          node._checkbox.prop('checked', checked);
+          node._checkbox.prop('indeterminate', indeterminate);
+          node._checkbox.attr('aria-checked', indeterminate ? 'mixed' : checked ? 'true' : 'false');
+        }
+        return { total, selected };
+      }
+
+      function updateSelectionStatus() {
+        if (!treeRoot) {
+          statusArea.text(`${selectedIds.size} saved variable(s); load the tree to edit the selection.`);
+          return;
+        }
+        const state = updateChecks(treeRoot);
+        statusArea.text(`${state.selected} of ${state.total} variable(s) selected`);
+      }
+
+      function renderNode(node, expanded) {
+        const item = $('<li/>');
+        const row = $('<div class="opcua-tree-row"/>');
+        const hasChildren = Array.isArray(node.children) && node.children.length > 0;
+        const toggle = $('<button type="button" class="opcua-tree-toggle" aria-label="Toggle branch"><i class="fa"/></button>');
+        if (!hasChildren) toggle.addClass('is-leaf');
+        const checkbox = $('<input type="checkbox" class="opcua-tree-check">');
+        const label = $('<span class="opcua-tree-label"/>').text(node.displayName || node.browseName || node.nodeId);
+        const nodeClass = $('<span class="opcua-tree-class"/>').text(node.nodeClass === 'Variable' ? 'variable' : 'folder');
+        row.append(toggle, checkbox, label, nodeClass);
+        item.append(row);
+        node._checkbox = checkbox;
+        node._listItem = item;
+
+        let childrenElement = null;
+        if (hasChildren) {
+          childrenElement = $('<ul/>');
+          node.children.forEach((child) => childrenElement.append(renderNode(child, false)));
+          item.append(childrenElement);
+          node._childrenElement = childrenElement;
+          const setExpanded = (open) => {
+            childrenElement.toggle(open);
+            toggle.children('i').attr('class', open ? 'fa fa-caret-down' : 'fa fa-caret-right');
+          };
+          setExpanded(expanded);
+          toggle.on('click', () => setExpanded(!childrenElement.is(':visible')));
+        }
+
+        checkbox.on('change', function () {
+          setSubtree(node, this.checked);
+          updateSelectionStatus();
+        });
+        return item;
+      }
+
+      function showSubtree(node, visible) {
+        if (node._listItem) node._listItem.toggle(visible);
+        (node.children || []).forEach((child) => showSubtree(child, visible));
+      }
+
+      function applyFilter(node, term) {
+        const text = `${node.displayName || ''} ${node.browseName || ''} ${node.browsePath || ''} ${node.nodeId || ''}`.toLowerCase();
+        if (term && text.includes(term)) {
+          showSubtree(node, true);
+          if (node._childrenElement) node._childrenElement.show();
+          return true;
+        }
+        let childMatch = false;
+        (node.children || []).forEach((child) => { if (applyFilter(child, term)) childMatch = true; });
+        const visible = !term || childMatch;
+        if (node._listItem) node._listItem.toggle(visible);
+        if (term && childMatch && node._childrenElement) node._childrenElement.show();
+        return visible;
+      }
+
+      function renderTree(root) {
+        treeRoot = root;
+        treeLoaded = true;
+        const available = new Map();
+        walk(root, (node) => {
+          if (node.nodeClass === 'Variable') available.set(node.nodeId, descriptor(node));
+        });
+        selectedIds = new Set([...selectedIds].filter((nodeId) => available.has(nodeId)));
+        selectedDescriptors = new Map([...selectedIds].map((nodeId) => [nodeId, available.get(nodeId)]));
+        treeArea.empty().append($('<ul/>').append(renderNode(root, true)));
+        updateSelectionStatus();
+      }
+
+      loadButton.on('click', function () {
+        const connectionId = $('#node-input-connection').val();
+        if (!connectionId || connectionId === '_ADD_') {
+          statusArea.text('Select, save, and deploy a connection before loading the tree.');
+          return;
+        }
+        loadButton.addClass('disabled').attr('disabled', 'disabled');
+        loadIcon.attr('class', 'fa fa-spinner fa-spin');
+        statusArea.text('Browsing the OPC UA address space...');
+        $.ajax({
+          url: adminUrl(), method: 'POST', contentType: 'application/json', dataType: 'json',
+          data: JSON.stringify({
+            connectionId,
+            rootNodeId: $('#node-input-rootNodeId').val() || 'ns=0;i=85',
+            maxDepth: $('#node-input-maxDepth').val(),
+            maxNodes: $('#node-input-maxNodes').val(),
+            attributeBatchSize: $('#node-input-attributeBatchSize').val()
+          })
+        }).done((data) => {
+          if (!data || !data.tree) {
+            statusArea.text('Browse returned no node tree.');
+            return;
+          }
+          renderTree(data.tree);
+        }).fail((request) => {
+          const message = request.responseJSON && request.responseJSON.error || request.responseText || 'Browse failed';
+          statusArea.text(message);
+        }).always(() => {
+          loadButton.removeClass('disabled').removeAttr('disabled');
+          loadIcon.attr('class', 'fa fa-search');
+        });
+      });
+
+      $('#node-input-selectAll').on('click', () => {
+        if (!treeRoot) return;
+        setSubtree(treeRoot, true);
+        updateSelectionStatus();
+      });
+      $('#node-input-clearSelection').on('click', () => {
+        if (treeRoot) setSubtree(treeRoot, false);
+        else { selectedIds.clear(); selectedDescriptors.clear(); }
+        updateSelectionStatus();
+      });
+      $('#node-input-treeSearch').on('input', function () {
+        if (treeRoot) applyFilter(treeRoot, String(this.value || '').trim().toLowerCase());
+      });
+      updateSelectionStatus();
+      self._opcuaBrowseEditorSelection = () => treeLoaded ? [...selectedDescriptors.values()] : self.selectedNodes || [];
+    },
+    oneditsave: function () {
+      if (this._opcuaBrowseEditorSelection) this.selectedNodes = this._opcuaBrowseEditorSelection();
+      delete this._opcuaBrowseEditorSelection;
+    },
+    oneditcancel: function () { delete this._opcuaBrowseEditorSelection; },
+    label: function () { return this.name || 'tier0-opcua-browse'; }
+  });
+</script>
