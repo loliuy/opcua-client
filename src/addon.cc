@@ -9,8 +9,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <exception>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -227,6 +230,7 @@ bool GetBool(const Napi::Object& object, const char* name, bool fallback) {
 
 struct RawChange {
   uint32_t monitored_item_id = 0;
+  uint32_t client_handle = 0;
   std::string node_id;
   UA_DataValue value;
   std::chrono::steady_clock::time_point enqueued_at;
@@ -261,19 +265,23 @@ struct MonitoredContext {
   std::shared_ptr<NotificationQueue> notifications;
   std::string node_id;
   uint32_t monitored_item_id = 0;
+  uint32_t client_handle = 0;
 };
 
 struct SubscriptionContext {
   uint32_t subscription_id = 0;
   std::shared_ptr<NotificationQueue> notifications;
   std::map<uint32_t, std::unique_ptr<MonitoredContext>> monitored;
+  std::unordered_map<uint32_t, MonitoredContext*> monitored_by_client_handle;
+  uint32_t next_client_handle = 1;
 };
 
 struct OperationLimits {
-  uint32_t max_nodes_per_read = 0;
-  uint32_t max_nodes_per_write = 0;
-  uint32_t max_nodes_per_browse = 0;
-  uint32_t max_monitored_items_per_call = 0;
+  std::atomic<uint32_t> max_nodes_per_read{0};
+  std::atomic<uint32_t> max_nodes_per_write{0};
+  std::atomic<uint32_t> max_nodes_per_browse{0};
+  std::atomic<uint32_t> max_monitored_items_per_call{0};
+  std::atomic<uint32_t> max_monitored_items_per_subscription{0};
 };
 
 struct CachedNodeId {
@@ -284,11 +292,29 @@ struct CachedNodeId {
   CachedNodeId& operator=(const CachedNodeId&) = delete;
 };
 
+struct ClientCommand {
+  std::function<void()> execute;
+  std::mutex completion_mutex;
+  std::condition_variable completion_cv;
+  bool completed = false;
+  std::string rejection;
+};
+
 struct ClientContext {
   UA_Client* client = nullptr;
   std::atomic<bool> running{false};
   std::thread iterate_thread;
-  std::mutex mutex;
+  std::mutex command_mutex;
+  std::condition_variable command_cv;
+  std::deque<std::shared_ptr<ClientCommand>> commands;
+  size_t command_queue_capacity = 256;
+  uint32_t command_queue_timeout_ms = 10000;
+  size_t command_queue_max_depth = 0;
+  std::atomic<uint64_t> commands_enqueued{0};
+  std::atomic<uint64_t> commands_completed{0};
+  std::atomic<uint64_t> commands_rejected{0};
+  std::atomic<uint64_t> commands_timed_out{0};
+  std::atomic<uint32_t> commands_active{0};
   std::map<uint32_t, std::unique_ptr<SubscriptionContext>> subscriptions;
   OperationLimits operation_limits;
   std::mutex node_id_cache_mutex;
@@ -474,17 +500,14 @@ bool CopyCachedNodeId(ClientContext* context, const std::string& text, UA_NodeId
 }
 
 void ReadOperationLimits(ClientContext* context) {
-  constexpr size_t count = 4;
+  constexpr size_t count = 5;
   const UA_UInt32 node_ids[count] = {
       UA_NS0ID_SERVER_SERVERCAPABILITIES_OPERATIONLIMITS_MAXNODESPERREAD,
       UA_NS0ID_SERVER_SERVERCAPABILITIES_OPERATIONLIMITS_MAXNODESPERWRITE,
       UA_NS0ID_SERVER_SERVERCAPABILITIES_OPERATIONLIMITS_MAXNODESPERBROWSE,
-      UA_NS0ID_SERVER_SERVERCAPABILITIES_OPERATIONLIMITS_MAXMONITOREDITEMSPERCALL};
-  uint32_t* targets[count] = {
-      &context->operation_limits.max_nodes_per_read,
-      &context->operation_limits.max_nodes_per_write,
-      &context->operation_limits.max_nodes_per_browse,
-      &context->operation_limits.max_monitored_items_per_call};
+      UA_NS0ID_SERVER_SERVERCAPABILITIES_OPERATIONLIMITS_MAXMONITOREDITEMSPERCALL,
+      24104};  // Server.ServerCapabilities.MaxMonitoredItemsPerSubscription
+  uint32_t values[count] = {};
   UA_ReadRequest request;
   UA_ReadRequest_init(&request);
   request.timestampsToReturn = UA_TIMESTAMPSTORETURN_NEITHER;
@@ -503,11 +526,16 @@ void ReadOperationLimits(ClientContext* context) {
       const UA_DataValue& value = response.results[index];
       if (value.hasValue && UA_Variant_isScalar(&value.value) &&
           value.value.type == &UA_TYPES[UA_TYPES_UINT32] && value.value.data) {
-        *targets[index] = *static_cast<UA_UInt32*>(value.value.data);
+        values[index] = *static_cast<UA_UInt32*>(value.value.data);
       }
     }
   }
   UA_ReadResponse_clear(&response);
+  context->operation_limits.max_nodes_per_read.store(values[0]);
+  context->operation_limits.max_nodes_per_write.store(values[1]);
+  context->operation_limits.max_nodes_per_browse.store(values[2]);
+  context->operation_limits.max_monitored_items_per_call.store(values[3]);
+  context->operation_limits.max_monitored_items_per_subscription.store(values[4]);
 }
 
 std::mutex clients_mutex;
@@ -520,11 +548,106 @@ std::shared_ptr<ClientContext> FindClient(uint64_t client_id) {
   return found == clients.end() ? nullptr : found->second;
 }
 
+void CloseNotificationQueue(const std::shared_ptr<NotificationQueue>& queue);
+
+void CompleteClientCommand(const std::shared_ptr<ClientCommand>& command,
+                           std::string rejection = {}) {
+  {
+    std::lock_guard<std::mutex> lock(command->completion_mutex);
+    command->rejection = std::move(rejection);
+    command->completed = true;
+  }
+  command->completion_cv.notify_one();
+}
+
+std::string RunClientCommand(const std::shared_ptr<ClientContext>& context,
+                             std::function<void()> execute) {
+  auto command = std::make_shared<ClientCommand>();
+  command->execute = std::move(execute);
+  {
+    std::lock_guard<std::mutex> lock(context->command_mutex);
+    if (!context->running.load()) {
+      context->commands_rejected.fetch_add(1);
+      return "OPC UA client is closing";
+    }
+    if (context->commands.size() >= context->command_queue_capacity) {
+      context->commands_rejected.fetch_add(1);
+      return "OPC UA client command queue is full";
+    }
+    context->commands.push_back(command);
+    context->commands_enqueued.fetch_add(1);
+    context->command_queue_max_depth =
+        std::max(context->command_queue_max_depth, context->commands.size());
+  }
+  context->command_cv.notify_one();
+
+  std::unique_lock<std::mutex> lock(command->completion_mutex);
+  if (!command->completion_cv.wait_for(
+          lock, std::chrono::milliseconds(context->command_queue_timeout_ms),
+          [&] { return command->completed; })) {
+    lock.unlock();
+    bool removed = false;
+    {
+      std::lock_guard<std::mutex> queue_lock(context->command_mutex);
+      auto found = std::find(context->commands.begin(), context->commands.end(), command);
+      if (found != context->commands.end()) {
+        context->commands.erase(found);
+        removed = true;
+      }
+    }
+    if (removed) {
+      context->commands_rejected.fetch_add(1);
+      context->commands_timed_out.fetch_add(1);
+      CompleteClientCommand(command, "OPC UA client command timed out while queued");
+    }
+    lock.lock();
+    command->completion_cv.wait(lock, [&] { return command->completed; });
+  }
+  return command->rejection;
+}
+
+void RejectPendingClientCommands(ClientContext* context, const std::string& reason) {
+  std::deque<std::shared_ptr<ClientCommand>> pending;
+  {
+    std::lock_guard<std::mutex> lock(context->command_mutex);
+    pending.swap(context->commands);
+  }
+  context->commands_rejected.fetch_add(pending.size());
+  for (auto& command : pending) CompleteClientCommand(command, reason);
+}
+
+void DrainClientCommands(ClientContext* context, size_t maximum) {
+  for (size_t index = 0; index < maximum; ++index) {
+    std::shared_ptr<ClientCommand> command;
+    {
+      std::lock_guard<std::mutex> lock(context->command_mutex);
+      if (context->commands.empty()) return;
+      command = std::move(context->commands.front());
+      context->commands.pop_front();
+    }
+    context->commands_active.store(1);
+    try {
+      command->execute();
+      context->commands_active.store(0);
+      context->commands_completed.fetch_add(1);
+      CompleteClientCommand(command);
+    } catch (const std::exception& error) {
+      context->commands_active.store(0);
+      context->commands_rejected.fetch_add(1);
+      CompleteClientCommand(command, std::string("OPC UA client command failed: ") + error.what());
+    } catch (...) {
+      context->commands_active.store(0);
+      context->commands_rejected.fetch_add(1);
+      CompleteClientCommand(command, "OPC UA client command failed unexpectedly");
+    }
+    if (!context->running.load()) return;
+  }
+}
+
 void Iterate(ClientContext* context) {
   while (context->running.load()) {
-    {
-      std::lock_guard<std::mutex> lock(context->mutex);
-      if (!context->client) return;
+    DrainClientCommands(context, 32);
+    if (context->client) {
       UA_Client_run_iterate(context->client, 20);
       if (context->force_secure_channel_reconnect.exchange(false)) {
         UA_Client_disconnectSecureChannelAsync(context->client);
@@ -534,7 +657,18 @@ void Iterate(ClientContext* context) {
         ReadOperationLimits(context);
       }
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    std::unique_lock<std::mutex> lock(context->command_mutex);
+    if (context->commands.empty() && context->running.load()) {
+      context->command_cv.wait_for(lock, std::chrono::milliseconds(5));
+    }
+  }
+  RejectPendingClientCommands(context, "OPC UA client is closing");
+  for (auto& entry : context->subscriptions) CloseNotificationQueue(entry.second->notifications);
+  context->subscriptions.clear();
+  if (context->client) {
+    UA_Client_disconnect(context->client);
+    UA_Client_delete(context->client);
+    context->client = nullptr;
   }
 }
 
@@ -553,16 +687,11 @@ void CloseClient(uint64_t client_id) {
     context = found->second;
     clients.erase(found);
   }
-  context->running.store(false);
+  const std::string shutdown_rejection = RunClientCommand(
+      context, [context] { context->running.store(false); });
+  if (!shutdown_rejection.empty()) context->running.store(false);
+  context->command_cv.notify_all();
   if (context->iterate_thread.joinable()) context->iterate_thread.join();
-  std::lock_guard<std::mutex> lock(context->mutex);
-  for (auto& entry : context->subscriptions) CloseNotificationQueue(entry.second->notifications);
-  context->subscriptions.clear();
-  if (context->client) {
-    UA_Client_disconnect(context->client);
-    UA_Client_delete(context->client);
-    context->client = nullptr;
-  }
   if (context->has_state_callback.load() &&
       !context->state_callback_released.exchange(true)) {
     context->state_callback.Release();
@@ -624,6 +753,7 @@ void DrainNotifications(Napi::Env env, Napi::Function callback, DrainRequest* re
     Napi::Object result = Napi::Object::New(env);
     result.Set("nodeId", data->node_id);
     result.Set("monitoredItemId", data->monitored_item_id);
+    result.Set("clientHandle", data->client_handle);
     result.Set("statusCode", StatusName(data->value.status));
     if (data->value.hasValue) {
       result.Set("value", VariantValue(env, &data->value.value));
@@ -714,6 +844,7 @@ void DataChange(UA_Client*, UA_UInt32, void*, UA_UInt32 monitored_item_id,
   if (!monitored || !monitored->notifications || !value) return;
   auto change = std::make_unique<RawChange>();
   change->monitored_item_id = monitored_item_id;
+  change->client_handle = monitored->client_handle;
   change->node_id = monitored->node_id;
   UA_DataValue_copy(value, &change->value);
   EnqueueNotification(monitored->notifications, std::move(change));
@@ -728,6 +859,21 @@ class PromiseWorker : public Napi::AsyncWorker {
   Napi::Promise::Deferred deferred_;
 };
 
+class ClientCommandWorker : public PromiseWorker {
+ public:
+  ClientCommandWorker(Napi::Promise::Deferred deferred,
+                      std::shared_ptr<ClientContext> context)
+      : PromiseWorker(deferred), context_(std::move(context)) {}
+  void Execute() override final {
+    const std::string rejection = RunClientCommand(
+        context_, [this] { ExecuteClientCommand(); });
+    if (!rejection.empty()) SetError(rejection);
+  }
+ protected:
+  virtual void ExecuteClientCommand() = 0;
+  std::shared_ptr<ClientContext> context_;
+};
+
 struct ConnectionOptions {
   std::string endpoint;
   std::string security_mode;
@@ -738,6 +884,7 @@ struct ConnectionOptions {
   uint32_t session_timeout = 60000;
   uint32_t connectivity_check_interval = 5000;
   uint32_t node_id_cache_size = 100000;
+  uint32_t command_queue_size = 256;
 };
 
 class ConnectWorker : public PromiseWorker {
@@ -755,6 +902,34 @@ class ConnectWorker : public PromiseWorker {
     context_ = std::make_shared<ClientContext>();
     context_->state_callback = state_callback_;
     context_->has_state_callback.store(has_state_callback_);
+    context_->node_id_cache_capacity = options_.node_id_cache_size;
+    context_->command_queue_capacity = std::max<uint32_t>(1, options_.command_queue_size);
+    context_->command_queue_timeout_ms = std::max<uint32_t>(1000, options_.timeout);
+    context_->running.store(true);
+    context_->iterate_thread = std::thread(Iterate, context_.get());
+    const std::string rejection = RunClientCommand(
+        context_, [this] { ConnectClient(); });
+    if (!rejection.empty()) SetError(rejection);
+    if (!connected_) {
+      context_->running.store(false);
+      context_->command_cv.notify_all();
+      if (context_->iterate_thread.joinable()) context_->iterate_thread.join();
+      return;
+    }
+    client_id_ = next_client_id.fetch_add(1);
+    {
+      std::lock_guard<std::mutex> lock(clients_mutex);
+      clients[client_id_] = context_;
+    }
+    transferred_ = true;
+  }
+  void OnOK() override { deferred_.Resolve(Napi::Number::New(Env(), static_cast<double>(client_id_))); }
+  void OnError(const Napi::Error& error) override {
+    if (has_state_callback_ && !transferred_) state_callback_.Release();
+    PromiseWorker::OnError(error);
+  }
+ private:
+  void ConnectClient() {
     context_->client = UA_Client_new();
     if (!context_->client) { SetError("Failed to create open62541 client"); return; }
     UA_ClientConfig* config = UA_Client_getConfig(context_->client);
@@ -773,28 +948,18 @@ class ConnectWorker : public PromiseWorker {
         : UA_Client_connectUsername(context_->client, options_.endpoint.c_str(), options_.user.c_str(), options_.password.c_str());
     if (!UA_StatusCode_isGood(status)) {
       SetError("Connect failed: " + StatusName(status));
-      UA_Client_delete(context_->client); context_->client = nullptr; return;
+      return;
     }
-    context_->node_id_cache_capacity = options_.node_id_cache_size;
     ReadOperationLimits(context_.get());
     context_->refresh_operation_limits.store(false);
-    client_id_ = next_client_id.fetch_add(1);
-    context_->running.store(true);
-    context_->iterate_thread = std::thread(Iterate, context_.get());
-    std::lock_guard<std::mutex> lock(clients_mutex);
-    clients[client_id_] = context_;
+    connected_ = true;
   }
-  void OnOK() override { deferred_.Resolve(Napi::Number::New(Env(), static_cast<double>(client_id_))); }
-  void OnError(const Napi::Error& error) override {
-    if (has_state_callback_ && !transferred_) state_callback_.Release();
-    PromiseWorker::OnError(error);
-  }
- private:
   ConnectionOptions options_;
   std::shared_ptr<ClientContext> context_;
   Napi::ThreadSafeFunction state_callback_;
   bool has_state_callback_ = false;
   bool transferred_ = false;
+  bool connected_ = false;
   uint64_t client_id_ = 0;
 };
 
@@ -808,15 +973,15 @@ class DisconnectWorker : public PromiseWorker {
   uint64_t client_id_;
 };
 
-class ReadManyWorker : public PromiseWorker {
+class ReadManyWorker : public ClientCommandWorker {
  public:
   ReadManyWorker(Napi::Promise::Deferred deferred, std::shared_ptr<ClientContext> context,
                  std::vector<std::string> node_ids)
-      : PromiseWorker(deferred), context_(std::move(context)), node_ids_(std::move(node_ids)) {
+      : ClientCommandWorker(deferred, std::move(context)), node_ids_(std::move(node_ids)) {
     UA_ReadResponse_init(&response_);
   }
   ~ReadManyWorker() override { UA_ReadResponse_clear(&response_); }
-  void Execute() override {
+  void ExecuteClientCommand() override {
     UA_ReadRequest request;
     UA_ReadRequest_init(&request);
     request.timestampsToReturn = UA_TIMESTAMPSTORETURN_BOTH;
@@ -829,11 +994,8 @@ class ReadManyWorker : public PromiseWorker {
       }
       request.nodesToRead[index].attributeId = UA_ATTRIBUTEID_VALUE;
     }
-    {
-      std::lock_guard<std::mutex> lock(context_->mutex);
-      if (!context_->client) { UA_ReadRequest_clear(&request); SetError("Client disconnected"); return; }
-      response_ = UA_Client_Service_read(context_->client, request);
-    }
+    if (!context_->client) { UA_ReadRequest_clear(&request); SetError("Client disconnected"); return; }
+    response_ = UA_Client_Service_read(context_->client, request);
     UA_ReadRequest_clear(&request);
     if (!UA_StatusCode_isGood(response_.responseHeader.serviceResult)) {
       SetError("Batch read failed: " + StatusName(response_.responseHeader.serviceResult));
@@ -856,7 +1018,6 @@ class ReadManyWorker : public PromiseWorker {
     deferred_.Resolve(output);
   }
  private:
-  std::shared_ptr<ClientContext> context_;
   std::vector<std::string> node_ids_;
   UA_ReadResponse response_;
 };
@@ -869,15 +1030,15 @@ struct WriteInput {
   ~WriteInput() { UA_Variant_clear(&value); }
 };
 
-class WriteManyWorker : public PromiseWorker {
+class WriteManyWorker : public ClientCommandWorker {
  public:
   WriteManyWorker(Napi::Promise::Deferred deferred, std::shared_ptr<ClientContext> context,
                   std::vector<std::unique_ptr<WriteInput>> inputs)
-      : PromiseWorker(deferred), context_(std::move(context)), inputs_(std::move(inputs)) {
+      : ClientCommandWorker(deferred, std::move(context)), inputs_(std::move(inputs)) {
     UA_WriteResponse_init(&response_);
   }
   ~WriteManyWorker() override { UA_WriteResponse_clear(&response_); }
-  void Execute() override {
+  void ExecuteClientCommand() override {
     UA_WriteRequest request;
     UA_WriteRequest_init(&request);
     request.nodesToWriteSize = inputs_.size();
@@ -892,11 +1053,8 @@ class WriteManyWorker : public PromiseWorker {
       target.value.hasValue = true;
       UA_Variant_copy(&inputs_[index]->value, &target.value.value);
     }
-    {
-      std::lock_guard<std::mutex> lock(context_->mutex);
-      if (!context_->client) { UA_WriteRequest_clear(&request); SetError("Client disconnected"); return; }
-      response_ = UA_Client_Service_write(context_->client, request);
-    }
+    if (!context_->client) { UA_WriteRequest_clear(&request); SetError("Client disconnected"); return; }
+    response_ = UA_Client_Service_write(context_->client, request);
     UA_WriteRequest_clear(&request);
     if (!UA_StatusCode_isGood(response_.responseHeader.serviceResult)) {
       SetError("Batch write failed: " + StatusName(response_.responseHeader.serviceResult));
@@ -913,7 +1071,6 @@ class WriteManyWorker : public PromiseWorker {
     deferred_.Resolve(output);
   }
  private:
-  std::shared_ptr<ClientContext> context_;
   std::vector<std::unique_ptr<WriteInput>> inputs_;
   UA_WriteResponse response_;
 };
@@ -943,17 +1100,16 @@ struct BrowseOptions {
   std::set<uint16_t> namespaces;
 };
 
-class BrowseWorker : public PromiseWorker {
+class BrowseWorker : public ClientCommandWorker {
  public:
   BrowseWorker(Napi::Promise::Deferred deferred, std::shared_ptr<ClientContext> context,
                BrowseOptions options)
-      : PromiseWorker(deferred), context_(std::move(context)), options_(std::move(options)) {}
-  void Execute() override {
+      : ClientCommandWorker(deferred, std::move(context)), options_(std::move(options)) {}
+  void ExecuteClientCommand() override {
     UA_NodeId root;
     UA_NodeId_init(&root);
     if (!CopyCachedNodeId(context_.get(), options_.root_node_id, &root)) { SetError("Invalid root NodeId: " + options_.root_node_id); return; }
     UA_NodeId_clear(&root);
-    std::lock_guard<std::mutex> lock(context_->mutex);
     if (!context_->client) { SetError("Client disconnected"); return; }
     if (!BrowseTree()) return;
     ReadAttributes();
@@ -1056,7 +1212,7 @@ class BrowseWorker : public PromiseWorker {
   void ReadAttributes() {
     const size_t attrs = 5;
     size_t batch = std::max<size_t>(1, options_.attribute_batch_size) * attrs;
-    uint32_t read_limit = context_->operation_limits.max_nodes_per_read;
+    uint32_t read_limit = context_->operation_limits.max_nodes_per_read.load();
     if (read_limit > 0) batch = std::min<size_t>(batch, read_limit);
     const size_t total_attributes = points_.size() * attrs;
     const UA_UInt32 ids[attrs] = {
@@ -1104,19 +1260,18 @@ class BrowseWorker : public PromiseWorker {
     }
   }
 
-  std::shared_ptr<ClientContext> context_;
   BrowseOptions options_;
   std::vector<BrowsePoint> points_;
 };
 
-class CreateSubscriptionWorker : public PromiseWorker {
+class CreateSubscriptionWorker : public ClientCommandWorker {
  public:
   CreateSubscriptionWorker(Napi::Promise::Deferred deferred, std::shared_ptr<ClientContext> context,
                            Napi::Function callback, uint32_t queue_size, double publishing_interval,
                            uint32_t lifetime, uint32_t keepalive, uint32_t max_notifications,
                            uint32_t callback_batch_size, std::string queue_mode,
                            std::string overflow_policy)
-      : PromiseWorker(deferred), context_(std::move(context)), publishing_interval_(publishing_interval),
+      : ClientCommandWorker(deferred, std::move(context)), publishing_interval_(publishing_interval),
         lifetime_(lifetime), keepalive_(keepalive), max_notifications_(max_notifications),
         queue_size_(std::max<uint32_t>(1, queue_size)),
         callback_batch_size_(std::max<uint32_t>(1, callback_batch_size)),
@@ -1124,13 +1279,12 @@ class CreateSubscriptionWorker : public PromiseWorker {
         overflow_policy_(overflow_policy == "drop-newest" ? "drop-newest" : "drop-oldest") {
     callback_ = Napi::ThreadSafeFunction::New(Env(), callback, "OpcUaDataChangeBatches", 1, 1);
   }
-  void Execute() override {
+  void ExecuteClientCommand() override {
     UA_CreateSubscriptionRequest request = UA_CreateSubscriptionRequest_default();
     request.requestedPublishingInterval = publishing_interval_;
     request.requestedLifetimeCount = lifetime_;
     request.requestedMaxKeepAliveCount = keepalive_;
     request.maxNotificationsPerPublish = max_notifications_;
-    std::lock_guard<std::mutex> lock(context_->mutex);
     if (!context_->client) { SetError("Client disconnected"); return; }
     UA_CreateSubscriptionResponse response = UA_Client_Subscriptions_create(context_->client, request, nullptr, nullptr, nullptr);
     status_ = response.responseHeader.serviceResult; subscription_id_ = response.subscriptionId;
@@ -1149,27 +1303,28 @@ class CreateSubscriptionWorker : public PromiseWorker {
   void OnOK() override { Napi::Object result = Napi::Object::New(Env()); result.Set("subscriptionId", subscription_id_); result.Set("statusCode", StatusName(status_)); deferred_.Resolve(result); }
   void OnError(const Napi::Error& error) override { if (!transferred_) callback_.Release(); PromiseWorker::OnError(error); }
  private:
-  std::shared_ptr<ClientContext> context_; Napi::ThreadSafeFunction callback_; bool transferred_ = false;
+  Napi::ThreadSafeFunction callback_; bool transferred_ = false;
   double publishing_interval_; uint32_t lifetime_; uint32_t keepalive_; uint32_t max_notifications_;
   uint32_t queue_size_; uint32_t callback_batch_size_; std::string queue_mode_; std::string overflow_policy_;
   uint32_t subscription_id_ = 0; UA_StatusCode status_ = UA_STATUSCODE_GOOD;
 };
 
 struct MonitorInput { std::string node_id; double sampling_interval; uint32_t queue_size; bool discard_oldest; std::string deadband_type; double deadband_value; };
-struct MonitorResult { std::string node_id; uint32_t monitored_item_id = 0; UA_StatusCode status = UA_STATUSCODE_BADUNEXPECTEDERROR; };
+struct MonitorResult { std::string node_id; uint32_t monitored_item_id = 0; uint32_t client_handle = 0; UA_StatusCode status = UA_STATUSCODE_BADUNEXPECTEDERROR; };
 
-class AddMonitoredWorker : public PromiseWorker {
+class AddMonitoredWorker : public ClientCommandWorker {
  public:
   AddMonitoredWorker(Napi::Promise::Deferred deferred, std::shared_ptr<ClientContext> context,
-                     uint32_t subscription_id, std::vector<MonitorInput> inputs)
-      : PromiseWorker(deferred), context_(std::move(context)), subscription_id_(subscription_id), inputs_(std::move(inputs)) {}
-  void Execute() override {
-    std::lock_guard<std::mutex> lock(context_->mutex);
+                     uint32_t subscription_id, std::vector<MonitorInput> inputs,
+                     UA_TimestampsToReturn timestamps_to_return)
+      : ClientCommandWorker(deferred, std::move(context)), subscription_id_(subscription_id),
+        inputs_(std::move(inputs)), timestamps_to_return_(timestamps_to_return) {}
+  void ExecuteClientCommand() override {
     auto subscription_it = context_->subscriptions.find(subscription_id_);
     if (!context_->client || subscription_it == context_->subscriptions.end()) { SetError("Subscription not found"); return; }
     auto* subscription = subscription_it->second.get();
     UA_CreateMonitoredItemsRequest request; UA_CreateMonitoredItemsRequest_init(&request);
-    request.subscriptionId = subscription_id_; request.timestampsToReturn = UA_TIMESTAMPSTORETURN_BOTH;
+    request.subscriptionId = subscription_id_; request.timestampsToReturn = timestamps_to_return_;
     request.itemsToCreateSize = inputs_.size();
     request.itemsToCreate = static_cast<UA_MonitoredItemCreateRequest*>(UA_Array_new(inputs_.size(), &UA_TYPES[UA_TYPES_MONITOREDITEMCREATEREQUEST]));
     std::vector<std::unique_ptr<MonitoredContext>> contexts(inputs_.size());
@@ -1180,7 +1335,13 @@ class AddMonitoredWorker : public PromiseWorker {
       auto& item = request.itemsToCreate[index];
       if (!CopyCachedNodeId(context_.get(), inputs_[index].node_id, &item.itemToMonitor.nodeId)) { UA_CreateMonitoredItemsRequest_clear(&request); SetError("Invalid NodeId: " + inputs_[index].node_id); return; }
       item.itemToMonitor.attributeId = UA_ATTRIBUTEID_VALUE; item.monitoringMode = UA_MONITORINGMODE_REPORTING;
-      item.requestedParameters.clientHandle = static_cast<uint32_t>(index + 1);
+      uint32_t client_handle = 0;
+      do {
+        client_handle = subscription->next_client_handle++;
+      } while (client_handle == 0 ||
+               subscription->monitored_by_client_handle.find(client_handle) !=
+                   subscription->monitored_by_client_handle.end());
+      item.requestedParameters.clientHandle = client_handle;
       item.requestedParameters.samplingInterval = inputs_[index].sampling_interval;
       item.requestedParameters.queueSize = inputs_[index].queue_size;
       item.requestedParameters.discardOldest = inputs_[index].discard_oldest;
@@ -1193,7 +1354,7 @@ class AddMonitoredWorker : public PromiseWorker {
         item.requestedParameters.filter.content.decoded.type = &UA_TYPES[UA_TYPES_DATACHANGEFILTER];
         item.requestedParameters.filter.content.decoded.data = filters[index].get();
       }
-      contexts[index] = std::make_unique<MonitoredContext>(); contexts[index]->notifications = subscription->notifications; contexts[index]->node_id = inputs_[index].node_id; context_ptrs[index] = contexts[index].get();
+      contexts[index] = std::make_unique<MonitoredContext>(); contexts[index]->notifications = subscription->notifications; contexts[index]->node_id = inputs_[index].node_id; contexts[index]->client_handle = client_handle; context_ptrs[index] = contexts[index].get();
     }
     UA_CreateMonitoredItemsResponse response = UA_Client_MonitoredItems_createDataChanges(context_->client, request, context_ptrs.data(), callbacks.data(), nullptr);
     for (size_t index = 0; index < filters.size(); ++index) {
@@ -1202,46 +1363,46 @@ class AddMonitoredWorker : public PromiseWorker {
     UA_CreateMonitoredItemsRequest_clear(&request);
     if (!UA_StatusCode_isGood(response.responseHeader.serviceResult)) { UA_CreateMonitoredItemsResponse_clear(&response); SetError("Create monitored items failed: " + StatusName(response.responseHeader.serviceResult)); return; }
     for (size_t index = 0; index < inputs_.size(); ++index) {
-      MonitorResult result; result.node_id = inputs_[index].node_id;
+      MonitorResult result; result.node_id = inputs_[index].node_id; result.client_handle = contexts[index]->client_handle;
       if (index < response.resultsSize) {
         result.status = response.results[index].statusCode; result.monitored_item_id = response.results[index].monitoredItemId;
-        if (UA_StatusCode_isGood(result.status)) { contexts[index]->monitored_item_id = result.monitored_item_id; subscription->monitored[result.monitored_item_id] = std::move(contexts[index]); }
+        if (UA_StatusCode_isGood(result.status)) { contexts[index]->monitored_item_id = result.monitored_item_id; auto* monitored_context = contexts[index].get(); subscription->monitored_by_client_handle[monitored_context->client_handle] = monitored_context; subscription->monitored[result.monitored_item_id] = std::move(contexts[index]); }
       }
       results_.push_back(result);
     }
     UA_CreateMonitoredItemsResponse_clear(&response);
   }
-  void OnOK() override { Napi::Array output = Napi::Array::New(Env(), results_.size()); for (size_t index = 0; index < results_.size(); ++index) { Napi::Object item = Napi::Object::New(Env()); item.Set("nodeId", results_[index].node_id); item.Set("monitoredItemId", results_[index].monitored_item_id); item.Set("statusCode", StatusName(results_[index].status)); output.Set(index, item); } deferred_.Resolve(output); }
+  void OnOK() override { Napi::Array output = Napi::Array::New(Env(), results_.size()); for (size_t index = 0; index < results_.size(); ++index) { Napi::Object item = Napi::Object::New(Env()); item.Set("nodeId", results_[index].node_id); item.Set("monitoredItemId", results_[index].monitored_item_id); item.Set("clientHandle", results_[index].client_handle); item.Set("statusCode", StatusName(results_[index].status)); output.Set(index, item); } deferred_.Resolve(output); }
  private:
-  std::shared_ptr<ClientContext> context_; uint32_t subscription_id_; std::vector<MonitorInput> inputs_; std::vector<MonitorResult> results_;
+  uint32_t subscription_id_; std::vector<MonitorInput> inputs_; std::vector<MonitorResult> results_;
+  UA_TimestampsToReturn timestamps_to_return_;
 };
 
-class RemoveMonitoredWorker : public PromiseWorker {
+class RemoveMonitoredWorker : public ClientCommandWorker {
  public:
   RemoveMonitoredWorker(Napi::Promise::Deferred deferred, std::shared_ptr<ClientContext> context,
                         uint32_t subscription_id, std::vector<uint32_t> ids)
-      : PromiseWorker(deferred), context_(std::move(context)), subscription_id_(subscription_id), ids_(std::move(ids)) { UA_DeleteMonitoredItemsResponse_init(&response_); }
+      : ClientCommandWorker(deferred, std::move(context)), subscription_id_(subscription_id), ids_(std::move(ids)) { UA_DeleteMonitoredItemsResponse_init(&response_); }
   ~RemoveMonitoredWorker() override { UA_DeleteMonitoredItemsResponse_clear(&response_); }
-  void Execute() override {
-    std::lock_guard<std::mutex> lock(context_->mutex); auto sub = context_->subscriptions.find(subscription_id_);
+  void ExecuteClientCommand() override {
+    auto sub = context_->subscriptions.find(subscription_id_);
     if (!context_->client || sub == context_->subscriptions.end()) { SetError("Subscription not found"); return; }
     UA_DeleteMonitoredItemsRequest request; UA_DeleteMonitoredItemsRequest_init(&request); request.subscriptionId = subscription_id_; request.monitoredItemIdsSize = ids_.size(); request.monitoredItemIds = static_cast<UA_UInt32*>(UA_Array_new(ids_.size(), &UA_TYPES[UA_TYPES_UINT32]));
     std::copy(ids_.begin(), ids_.end(), request.monitoredItemIds); response_ = UA_Client_MonitoredItems_delete(context_->client, request); UA_DeleteMonitoredItemsRequest_clear(&request);
     if (!UA_StatusCode_isGood(response_.responseHeader.serviceResult)) { SetError("Delete monitored items failed: " + StatusName(response_.responseHeader.serviceResult)); return; }
-    for (size_t index = 0; index < ids_.size() && index < response_.resultsSize; ++index) if (UA_StatusCode_isGood(response_.results[index])) sub->second->monitored.erase(ids_[index]);
+    for (size_t index = 0; index < ids_.size() && index < response_.resultsSize; ++index) if (UA_StatusCode_isGood(response_.results[index])) { auto monitored = sub->second->monitored.find(ids_[index]); if (monitored != sub->second->monitored.end()) { sub->second->monitored_by_client_handle.erase(monitored->second->client_handle); sub->second->monitored.erase(monitored); } }
   }
   void OnOK() override { Napi::Array output = Napi::Array::New(Env(), ids_.size()); for (size_t index = 0; index < ids_.size(); ++index) { Napi::Object item = Napi::Object::New(Env()); item.Set("monitoredItemId", ids_[index]); item.Set("statusCode", index < response_.resultsSize ? StatusName(response_.results[index]) : "BadUnexpectedError"); output.Set(index, item); } deferred_.Resolve(output); }
  private:
-  std::shared_ptr<ClientContext> context_; uint32_t subscription_id_; std::vector<uint32_t> ids_; UA_DeleteMonitoredItemsResponse response_;
+  uint32_t subscription_id_; std::vector<uint32_t> ids_; UA_DeleteMonitoredItemsResponse response_;
 };
 
-class ValidateSubscriptionWorker : public PromiseWorker {
+class ValidateSubscriptionWorker : public ClientCommandWorker {
  public:
   ValidateSubscriptionWorker(Napi::Promise::Deferred deferred,
                              std::shared_ptr<ClientContext> context, uint32_t id)
-      : PromiseWorker(deferred), context_(std::move(context)), id_(id) {}
-  void Execute() override {
-    std::lock_guard<std::mutex> lock(context_->mutex);
+      : ClientCommandWorker(deferred, std::move(context)), id_(id) {}
+  void ExecuteClientCommand() override {
     if (!context_->client || !context_->connected.load()) {
       SetError("Client reconnecting");
       return;
@@ -1281,19 +1442,18 @@ class ValidateSubscriptionWorker : public PromiseWorker {
     deferred_.Resolve(output);
   }
  private:
-  std::shared_ptr<ClientContext> context_;
   uint32_t id_;
   UA_StatusCode status_ = UA_STATUSCODE_GOOD;
 };
 
-class DeleteSubscriptionWorker : public PromiseWorker {
+class DeleteSubscriptionWorker : public ClientCommandWorker {
  public:
   DeleteSubscriptionWorker(Napi::Promise::Deferred deferred, std::shared_ptr<ClientContext> context, uint32_t id)
-      : PromiseWorker(deferred), context_(std::move(context)), id_(id) {}
-  void Execute() override { std::lock_guard<std::mutex> lock(context_->mutex); auto found = context_->subscriptions.find(id_); if (found == context_->subscriptions.end()) return; status_ = context_->client ? UA_Client_Subscriptions_deleteSingle(context_->client, id_) : UA_STATUSCODE_BADCONNECTIONCLOSED; CloseNotificationQueue(found->second->notifications); context_->subscriptions.erase(found); if (!UA_StatusCode_isGood(status_)) SetError("Delete subscription failed: " + StatusName(status_)); }
+      : ClientCommandWorker(deferred, std::move(context)), id_(id) {}
+  void ExecuteClientCommand() override { auto found = context_->subscriptions.find(id_); if (found == context_->subscriptions.end()) return; status_ = context_->client ? UA_Client_Subscriptions_deleteSingle(context_->client, id_) : UA_STATUSCODE_BADCONNECTIONCLOSED; CloseNotificationQueue(found->second->notifications); context_->subscriptions.erase(found); if (!UA_StatusCode_isGood(status_)) SetError("Delete subscription failed: " + StatusName(status_)); }
   void OnOK() override { Napi::Object result = Napi::Object::New(Env()); result.Set("subscriptionId", id_); result.Set("statusCode", StatusName(status_)); deferred_.Resolve(result); }
  private:
-  std::shared_ptr<ClientContext> context_; uint32_t id_; UA_StatusCode status_ = UA_STATUSCODE_GOOD;
+  uint32_t id_; UA_StatusCode status_ = UA_STATUSCODE_GOOD;
 };
 
 std::shared_ptr<ClientContext> RequireClient(Napi::Env env, const Napi::Value& value) {
@@ -1309,10 +1469,11 @@ Napi::Value GetClientDiagnostics(const Napi::CallbackInfo& info) {
   if (!context) return env.Undefined();
   Napi::Object result = Napi::Object::New(env);
   Napi::Object limits = Napi::Object::New(env);
-  limits.Set("maxNodesPerRead", context->operation_limits.max_nodes_per_read);
-  limits.Set("maxNodesPerWrite", context->operation_limits.max_nodes_per_write);
-  limits.Set("maxNodesPerBrowse", context->operation_limits.max_nodes_per_browse);
-  limits.Set("maxMonitoredItemsPerCall", context->operation_limits.max_monitored_items_per_call);
+  limits.Set("maxNodesPerRead", context->operation_limits.max_nodes_per_read.load());
+  limits.Set("maxNodesPerWrite", context->operation_limits.max_nodes_per_write.load());
+  limits.Set("maxNodesPerBrowse", context->operation_limits.max_nodes_per_browse.load());
+  limits.Set("maxMonitoredItemsPerCall", context->operation_limits.max_monitored_items_per_call.load());
+  limits.Set("maxMonitoredItemsPerSubscription", context->operation_limits.max_monitored_items_per_subscription.load());
   result.Set("operationLimits", limits);
 
   Napi::Object connection = Napi::Object::New(env);
@@ -1327,6 +1488,24 @@ Napi::Value GetClientDiagnostics(const Napi::CallbackInfo& info) {
   connection.Set("disconnectCount", Napi::Number::New(env, static_cast<double>(context->disconnect_count.load())));
   connection.Set("sessionGeneration", Napi::Number::New(env, static_cast<double>(context->session_generation.load())));
   result.Set("connection", connection);
+
+  size_t command_queue_depth = 0;
+  size_t command_queue_max_depth = 0;
+  {
+    std::lock_guard<std::mutex> lock(context->command_mutex);
+    command_queue_depth = context->commands.size();
+    command_queue_max_depth = context->command_queue_max_depth;
+  }
+  Napi::Object command_queue = Napi::Object::New(env);
+  command_queue.Set("depth", Napi::Number::New(env, static_cast<double>(command_queue_depth)));
+  command_queue.Set("capacity", Napi::Number::New(env, static_cast<double>(context->command_queue_capacity)));
+  command_queue.Set("maxDepth", Napi::Number::New(env, static_cast<double>(command_queue_max_depth)));
+  command_queue.Set("active", context->commands_active.load());
+  command_queue.Set("enqueued", Napi::Number::New(env, static_cast<double>(context->commands_enqueued.load())));
+  command_queue.Set("completed", Napi::Number::New(env, static_cast<double>(context->commands_completed.load())));
+  command_queue.Set("rejected", Napi::Number::New(env, static_cast<double>(context->commands_rejected.load())));
+  command_queue.Set("timedOut", Napi::Number::New(env, static_cast<double>(context->commands_timed_out.load())));
+  result.Set("commandQueue", command_queue);
 
   size_t cache_size = 0;
   {
@@ -1347,7 +1526,7 @@ Napi::Value GetClientDiagnostics(const Napi::CallbackInfo& info) {
 Napi::Value ConnectAsync(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env(); if (info.Length() < 1 || !info[0].IsObject()) { Napi::TypeError::New(env, "Connection options are required").ThrowAsJavaScriptException(); return env.Undefined(); }
   Napi::Object object = info[0].As<Napi::Object>(); ConnectionOptions options;
-  options.endpoint = GetString(object, "endpoint"); options.security_mode = GetString(object, "securityMode", "None"); options.security_policy = GetString(object, "securityPolicy", "None"); options.user = GetString(object, "user"); options.password = GetString(object, "password"); options.timeout = GetUInt(object, "requestTimeout", 10000); options.session_timeout = GetUInt(object, "requestedSessionTimeout", 60000); options.connectivity_check_interval = GetUInt(object, "connectivityCheckInterval", 5000); options.node_id_cache_size = GetUInt(object, "nodeIdCacheSize", 100000);
+  options.endpoint = GetString(object, "endpoint"); options.security_mode = GetString(object, "securityMode", "None"); options.security_policy = GetString(object, "securityPolicy", "None"); options.user = GetString(object, "user"); options.password = GetString(object, "password"); options.timeout = GetUInt(object, "requestTimeout", 10000); options.session_timeout = GetUInt(object, "requestedSessionTimeout", 60000); options.connectivity_check_interval = GetUInt(object, "connectivityCheckInterval", 5000); options.node_id_cache_size = GetUInt(object, "nodeIdCacheSize", 100000); options.command_queue_size = GetUInt(object, "commandQueueSize", 256);
   bool has_state_callback = info.Length() > 1 && info[1].IsFunction();
   Napi::ThreadSafeFunction state_callback;
   if (has_state_callback) {
@@ -1386,7 +1565,11 @@ Napi::Value CreateSubscriptionAsync(const Napi::CallbackInfo& info) {
 Napi::Value AddMonitoredItemsAsync(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env(); auto context = RequireClient(env, info[0]); if (!context || !info[2].IsArray()) return env.Undefined(); uint32_t subscription_id = info[1].ToNumber().Uint32Value(); Napi::Array array = info[2].As<Napi::Array>(); Napi::Object defaults = info.Length() > 3 && info[3].IsObject() ? info[3].As<Napi::Object>() : Napi::Object::New(env); std::vector<MonitorInput> inputs;
   for (uint32_t index = 0; index < array.Length(); ++index) { Napi::Object object = array.Get(index).As<Napi::Object>(); MonitorInput input; input.node_id = GetString(object, "nodeId"); input.sampling_interval = GetDouble(object, "samplingInterval", GetDouble(defaults, "samplingInterval", 1000)); input.queue_size = GetUInt(object, "queueSize", GetUInt(defaults, "queueSize", 10)); input.discard_oldest = GetBool(object, "discardOldest", GetBool(defaults, "discardOldest", true)); input.deadband_type = GetString(object, "deadbandType", GetString(defaults, "deadbandType", "none")); input.deadband_value = GetDouble(object, "deadbandValue", GetDouble(defaults, "deadbandValue", 0)); inputs.push_back(std::move(input)); }
-  auto deferred = Napi::Promise::Deferred::New(env); (new AddMonitoredWorker(deferred, context, subscription_id, std::move(inputs)))->Queue(); return deferred.Promise();
+  std::string timestamp_mode = GetString(defaults, "timestampMode", "source");
+  UA_TimestampsToReturn timestamps_to_return = timestamp_mode == "both" ? UA_TIMESTAMPSTORETURN_BOTH :
+      (timestamp_mode == "server" ? UA_TIMESTAMPSTORETURN_SERVER :
+      (timestamp_mode == "neither" ? UA_TIMESTAMPSTORETURN_NEITHER : UA_TIMESTAMPSTORETURN_SOURCE));
+  auto deferred = Napi::Promise::Deferred::New(env); (new AddMonitoredWorker(deferred, context, subscription_id, std::move(inputs), timestamps_to_return))->Queue(); return deferred.Promise();
 }
 
 Napi::Value RemoveMonitoredItemsAsync(const Napi::CallbackInfo& info) {

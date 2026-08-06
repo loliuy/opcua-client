@@ -1,5 +1,5 @@
 {
-  "name": "@loliuy/opcua-client",
+  "name": "@tier0/opcua-client",
   "version": "0.1.0",
   "description": "High-scale OPC UA client nodes for Node-RED powered by open62541",
   "license": "Apache-2.0",
@@ -26,7 +26,7 @@
     "build": "node-gyp rebuild",
     "clean": "node-gyp clean",
     "test": "node --test test/*.test.js",
-    "test:native": "node test/native.integration.js && node test/native.queue.integration.js && node test/reconnect.integration.js",
+    "test:native": "node test/native.integration.js && node test/native.queue.integration.js && node test/native.command-queue.integration.js && node test/reconnect.integration.js",
     "test:reconnect": "node test/reconnect.integration.js",
     "test:stress": "node test/stress.js",
     "test:nodered": "node test/nodered.integration.js",

@@ -25,6 +25,9 @@ module.exports = function registerConnectionNode(RED) {
       nodeIdCacheSize: Number.isFinite(Number(config.nodeIdCacheSize))
         ? Math.max(0, Math.floor(Number(config.nodeIdCacheSize)))
         : 100000,
+      commandQueueSize: Number.isFinite(Number(config.commandQueueSize))
+        ? Math.max(1, Math.floor(Number(config.commandQueueSize)))
+        : 256,
     });
 
     node.client.on('fault', (error) => node.warn(`OPC UA connection fault: ${error.message}`));

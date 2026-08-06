@@ -69,7 +69,7 @@ The native queue integration test also intentionally uses capacity 5 and batch s
 
 ## OperationLimits and NodeId cache optimization
 
-The P1 optimization reads the four standard server limits in one request and adds a bounded per-connection native parsed-NodeId cache. The 5,000-point standalone test recorded 5,011 cache entries, 65,001 hits, 5,011 misses, zero bypasses, and approximately 92.8% hit rate. Browse improved from 2,143 ms to 1,991 ms in the recorded local run; Read P50 remained 301 ms and Write P50 remained within local-run variance at 376 ms.
+The P1 optimization originally read four standard OperationLimits in one request and added a bounded per-connection native parsed-NodeId cache. It now also reads the optional `MaxMonitoredItemsPerSubscription` server capability. The 5,000-point standalone test recorded 5,011 cache entries, 65,001 hits, 5,011 misses, zero bypasses, and approximately 92.8% hit rate. Browse improved from 2,143 ms to 1,991 ms in the recorded local run; Read P50 remained 301 ms and Write P50 remained within local-run variance at 376 ms.
 
 The optimized Node-RED Flow results were:
 
@@ -80,4 +80,55 @@ The optimized Node-RED Flow results were:
 
 Against the immediately preceding P0 runs, 5,000-point Node-RED CPU changed from 2,050 ms to 1,990 ms and peak RSS from 143.1 MB to 139.1 MB. The 10,000-point CPU changed from 2,570 ms to 2,120 ms. The 10,000-point P1 run followed the sustained 5,000-point run in the same Node-RED process, so its 155.3 MB peak is a warmed-process regression value and should not be compared directly with the fresh-process memory baseline.
 
-The native integration fixture also advertises all four OperationLimits as 7 and verifies that the client reads those exact values. Its cache capacity is intentionally reduced to 32; the test remains bounded at 32 entries and reports 118 FIFO evictions while Browse, Read, Write, Subscribe, and cleanup all pass.
+The native integration fixture advertises the four OperationLimits as 7 and leaves `MaxMonitoredItemsPerSubscription` unspecified, which the client reports as 0 before applying its configured fallback. Its cache capacity is intentionally reduced to 32; the test remains bounded at 32 entries and reports 118 FIFO evictions while Browse, Read, Write, Subscribe, and cleanup all pass.
+
+## Multi-Subscription sharding and timed aggregation
+
+The 2026-08-06 real Node-RED smoke run forced the 100-point set into four Subscriptions by setting `maxItemsPerSubscription=25`. Browse, batch Read, batch Write, subscription creation, and the selectable Browse output all ran through a deployed Flow and a real OPC UA fixture.
+
+- Subscription creation: 72 ms for 100 MonitoredItems across 4 Subscriptions.
+- Two complete write rounds: 200 notifications delivered, 0 dropped, final values converged for 100/100 points.
+- Combined native queues: maximum depth 200 and capacity 200,000 across the four Subscriptions.
+- Node-RED process: 134.9 MB peak RSS and 130 ms sampled CPU for the complete smoke run.
+
+The outage run stopped and restarted the real fixture after subscription creation. The Subscribe node invalidated the old shard set and recovered exactly four Subscriptions containing 100/100 desired points. Subsequent writes again converged 100/100 final values with zero queue drops. Rebuild notifications can include current server values, so final per-point convergence and the recovered Subscription/MonitoredItem counts are the correctness gates rather than an exact raw notification count.
+
+The scale acceptance then used 5,000 points with `maxItemsPerSubscription=1000`. The deployed Node-RED Flow created exactly five Subscriptions in 478 ms, browsed 5,000 variables in 2,047 ms, read them in 321 ms, and completed each 5,000-point write round in 324 ms. The native queues delivered all 15,000 notifications with zero drops; final values converged for 5,000/5,000 points. Peak Node-RED RSS was 150.0 MB.
+
+The matching outage run rebuilt exactly five Subscriptions containing 5,000/5,000 desired points after the server restarted. It again delivered 15,000/15,000 native notifications with zero drops and converged every final value. The owner command queue completed 42/42 commands with maximum depth 4, zero rejection, and zero timeout; peak Node-RED RSS was 151.6 MB.
+
+## Single-owner native command queue
+
+The 2026-08-06 concurrency run used a real 3,000-point OPC UA fixture and submitted four Browse, four 200-point Read, and four 200-point Write operations concurrently. Including Connect, the native owner thread completed 13/13 commands with zero rejection and a maximum command queue depth of 4. A 1 ms JavaScript timer advanced 4,604 times during the run, confirming that the Node.js event loop remained responsive while the native owner serialized OPC UA work.
+
+The overload run reduced command queue capacity to 1. Queue depth never exceeded 1; seven commands were rejected immediately as full and one queued command was safely removed after its one-second queue timeout. The diagnostic counters reported two completed commands, eight total rejections, and one timeout. Native notification queue, reconnect, and real Node-RED four-Subscription recovery tests continued to pass after the ownership change.
+
+## 20,000-point sustained Node-RED pressure run
+
+The 2026-08-06 capacity run deployed the real nodes into Node-RED with 20,000 writable OPC UA variables, three complete Read rounds, four 5,000-item Subscriptions, and five complete Write rounds.
+
+| Metric | Result |
+| --- | ---: |
+| Browse 20,000 variables | 7,948 ms |
+| Read P50 / P95 | 1,236 / 1,559 ms |
+| Write P50 / P95 | 1,493 / 1,917 ms |
+| Create 20,000 MonitoredItems / 4 Subscriptions | 1,639 ms |
+| Native notifications | 120,000 / 120,000 delivered |
+| Final value convergence | 20,000 / 20,000 points |
+| Notification drops | 0 |
+| Maximum notification queue depth | 7,978 / 320,000 capacity |
+| Maximum native callback lag | 5.24 ms |
+| Owner commands | 367 / 367 completed, 0 rejected, 0 timed out |
+| Node-RED peak RSS | 342.9 MB |
+| Node-RED sampled CPU | 7,000 ms |
+| Complete run | 34.3 s |
+
+The collector observed 100,500 changes after its subscription-status gate, while native diagnostics recorded all 120,000 initial and write notifications. As in the smaller runs, notifications may arrive before the collector initializes its counter; zero native drops and convergence of every point to the final write value are the correctness gates. Phase sampling and an isolated external-writer run were subsequently used to locate and reduce the transient memory peak.
+
+## 20,000-point memory isolation and CSV Write optimization
+
+The same deployed Flow was tested with a separate native client generating the five write rounds. Node-RED still browsed 20,000 variables, rendered the 20,040-node editor tree, read all points, created four 5,000-item Subscriptions, collected notifications, and verified final convergence. Moving only write-payload construction outside Node-RED reduced its peak RSS to 170.27 MB. The phase peak during Subscribe creation was 166.47 MB and the peak during 100,000 external writes plus notification handling was 170.27 MB. All 120,000 native notifications were delivered with zero drops and 20,000/20,000 final convergence. This isolates the collection path from the CSV Write path and shows that subscription setup and notification delivery were not responsible for the earlier 342-362 MB peaks.
+
+Write CSV parsing was then changed from multiple whole-payload arrays and object copies to a single line scan that constructs compact final write descriptors. Two mixed Node-RED runs, each producing CSV and executing all 100,000 writes inside the Flow, recorded stable peaks of 226.73 MB and 226.06 MB. The immediately preceding fresh-process repeat peaked at 362.29 MB, so the repeatable peak reduction was approximately 37.6%. The optimized repeat recorded Write P50/P95 of 1,410/1,769 ms, delivered 120,000/120,000 native notifications with zero drops, and converged 20,000/20,000 final values. These are process-RSS engineering measurements; allocator and garbage-collector behavior still require production baselines on the target Node-RED image.
+
+The 20,000-point outage acceptance stopped and restarted the real OPC UA fixture after the initial four Subscriptions were created. The Subscribe node rebuilt exactly four Subscriptions with 20,000/20,000 MonitoredItems and zero failures. Two subsequent complete write rounds plus the rebuilt initial values delivered 60,000/60,000 native notifications with zero drops and final convergence for all 20,000 points. Recovery-phase RSS peaked at 175.04 MB and the complete run at 184.5 MB. The recovery status explicitly reported `rebuilt=true` and `dataGapPossible=true` because a server-side subscription rebuild cannot guarantee changes that occurred during the outage.

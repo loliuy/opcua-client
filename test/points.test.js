@@ -81,6 +81,27 @@ test('parses and coerces JSON and CSV write imports', () => {
   assert.equal(looksLikePointList('hello'), false);
 });
 
+test('streams CSV writes into compact deduplicated points', () => {
+  const points = messageWritePoints({
+    payload: [
+      'nodeId,value,dataType',
+      'ns=2;s=A,1,Double',
+      '# ignored comment',
+      'ns=2;s=B,false,Boolean',
+      'ns=2;s=A,2,Double',
+    ].join('\r\n'),
+  });
+  assert.deepEqual(points, [
+    { nodeId: 'ns=2;s=A', value: 2, dataType: 'Double' },
+    { nodeId: 'ns=2;s=B', value: false, dataType: 'Boolean' },
+  ]);
+
+  const arrayInput = messageWritePoints({
+    payload: [{ nodeId: 'ns=2;s=C', value: 3, dataType: 'Int32' }],
+  }, { inputFormat: 'csv' });
+  assert.equal(arrayInput[0].value, 3);
+});
+
 test('chunks large requests without losing order', () => {
   assert.deepEqual(chunks([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]]);
 });

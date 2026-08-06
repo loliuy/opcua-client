@@ -5,16 +5,22 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
 const { performance } = require('node:perf_hooks');
+const { OpcUaClient } = require('../lib/client');
 
 const adminUrl = process.env.NODE_RED_ADMIN_URL || 'http://127.0.0.1:1880';
 const pointCount = positiveInteger(process.env.OPCUA_NODERED_POINTS, 5000);
 const readRounds = positiveInteger(process.env.OPCUA_NODERED_READ_ROUNDS, 3);
 const writeRounds = positiveInteger(process.env.OPCUA_NODERED_WRITE_ROUNDS, 5);
 const batchSize = positiveInteger(process.env.OPCUA_NODERED_BATCH_SIZE, 500);
+const maxItemsPerSubscription = positiveInteger(
+  process.env.OPCUA_NODERED_MAX_ITEMS_PER_SUBSCRIPTION,
+  5000
+);
 const port = positiveInteger(process.env.OPCUA_NODERED_SERVER_PORT, 4845);
 const timeoutMs = positiveInteger(process.env.OPCUA_NODERED_TIMEOUT, 180000);
 const holdMs = Number(process.env.OPCUA_NODERED_HOLD_MS) || 0;
 const reconnectTest = process.env.OPCUA_NODERED_RECONNECT === '1';
+const externalWriteTest = process.env.OPCUA_NODERED_EXTERNAL_WRITE === '1';
 const routeRoot = `/_codex_opcua_bench_${Date.now().toString(36)}`;
 
 function positiveInteger(value, fallback) {
@@ -175,7 +181,7 @@ return msg;`;
     pointSource.replace('return msg;', "msg.opcua={command:'replace'}; return msg;"),
     220
   );
-  nodes.push({ id: subscribeId, type: 'tier0-opcua-subscribe', z: tabId, name: 'real massive subscribe', connection: connectionId, nodeId: '', publishingInterval: '100', lifetimeCount: '600', maxKeepAliveCount: '20', maxNotificationsPerPublish: '0', samplingInterval: '100', queueSize: '2', discardOldest: true, deadbandType: 'none', deadbandValue: '0', batchSize: String(batchSize), callbackQueueSize: String(Math.max(50000, pointCount * 4)), callbackBatchSize: '500', queueMode: 'all', overflowPolicy: 'drop-oldest', outputMode: 'batch', reconnectInterval: '5000', x: 800, y: 220, wires: [[subscribeResultId]] });
+  nodes.push({ id: subscribeId, type: 'tier0-opcua-subscribe', z: tabId, name: 'real massive subscribe', connection: connectionId, nodeId: '', publishingInterval: '100', lifetimeCount: '600', maxKeepAliveCount: '20', maxNotificationsPerPublish: '0', samplingInterval: '100', queueSize: '2', discardOldest: true, deadbandType: 'none', deadbandValue: '0', timestampMode: 'source', batchSize: String(batchSize), maxItemsPerSubscription: String(maxItemsPerSubscription), callbackQueueSize: String(Math.max(50000, pointCount * 4)), callbackBatchSize: '500', callbackFlushIntervalMs: '50', queueMode: 'all', overflowPolicy: 'drop-oldest', outputMode: 'batch', reconnectInterval: '5000', x: 800, y: 220, wires: [[subscribeResultId]] });
   nodes.push({ id: subscribeResultId, type: 'function', z: tabId, name: 'subscription collector', outputs: 1, timeout: 0, noerr: 0, initialize: '', finalize: '', libs: [], x: 1030, y: 220, wires: [[responseId]], func: `
 if (msg.opcua && msg.opcua.operation === 'subscription-status') {
   if (msg.payload.command === 'recover') {
@@ -187,7 +193,7 @@ if (msg.opcua && msg.opcua.operation === 'subscription-status') {
   if (msg.payload.command === 'replace') {
     flow.set('benchState', {count:msg._benchCount,received:0,changed:{},final:{},finalFloor:Number.MAX_SAFE_INTEGER});
   }
-  msg.payload={operation:'subscribe',command:msg.payload.command,desired:msg.payload.desired,monitored:msg.payload.monitored,elapsedMs:Date.now()-msg._benchStart};
+  msg.payload={operation:'subscribe',command:msg.payload.command,desired:msg.payload.desired,monitored:msg.payload.monitored,subscriptionCount:msg.payload.subscriptionCount,subscriptionIds:msg.payload.subscriptionIds,elapsedMs:Date.now()-msg._benchStart};
   return msg;
 }
 const state=flow.get('benchState');
@@ -229,6 +235,10 @@ return msg;`, 300);
   const resultsId = addFunction('subscription results', `const state=flow.get('benchState')||{}; msg.payload={operation:'results',count:state.count||0,received:state.received||0,distinctChanged:Object.keys(state.changed||{}).length,distinctFinalChanged:Object.keys(state.final||{}).length,finalFloor:state.finalFloor,queue:state.queue||{},recovery:state.recovery||null}; return msg;`, 380);
   wire(resultsHttp, resultsId); wire(resultsId, responseId);
 
+  const armHttp = addHttp('arm', 'post', 420);
+  const armId = addFunction('arm external writes', `const input=msg.payload||{}; const state=flow.get('benchState')||{}; state.finalFloor=Number(input.floor)||Number.MAX_SAFE_INTEGER; state.final={}; flow.set('benchState',state); msg.payload={operation:'arm',finalFloor:state.finalFloor}; return msg;`, 420);
+  wire(armHttp, armId); wire(armId, responseId);
+
   const clearHttp = addHttp('clear', 'post', 460);
   const clearPrep = addFunction('clear subscription', `msg._benchStart=Date.now(); msg.opcua={command:'clear'}; return msg;`, 460);
   wire(clearHttp, clearPrep); wire(clearPrep, subscribeId);
@@ -245,7 +255,7 @@ return msg;`, 300);
     info: 'Temporary flow created by test/nodered.integration.js',
     env: [],
     nodes,
-    configs: [{ id: connectionId, type: 'tier0-opcua-connection', name: 'benchmark connection', endpoint, securityMode: 'None', securityPolicy: 'None', user: '', certificate: '', privateKey: '', requestedSessionTimeout: '5000', requestTimeout: '1000', connectivityCheckInterval: '500', reconnectInterval: '200', maxReconnectInterval: '1000', nodeIdCacheSize: '100000' }],
+    configs: [{ id: connectionId, type: 'tier0-opcua-connection', name: 'benchmark connection', endpoint, securityMode: 'None', securityPolicy: 'None', user: '', certificate: '', privateKey: '', requestedSessionTimeout: '5000', requestTimeout: '1000', connectivityCheckInterval: '500', reconnectInterval: '200', maxReconnectInterval: '1000', nodeIdCacheSize: '100000', commandQueueSize: '256' }],
   };
 }
 
@@ -281,11 +291,23 @@ async function main() {
   const flow = createFlow(server.endpoint, server.namespace, server.rootNodeId);
   let deployed = false;
   let deployedFlowId = null;
+  let externalWriter = null;
   const nodeRedPid = findNodeRedPid();
   const startSample = processSample(nodeRedPid);
   let peakRssMb = startSample?.rssMb || 0;
+  let memoryPhase = 'deploy';
+  const phasePeakRssMb = {};
+  const sampleMemory = () => {
+    const rssMb = processSample(nodeRedPid)?.rssMb || 0;
+    peakRssMb = Math.max(peakRssMb, rssMb);
+    phasePeakRssMb[memoryPhase] = Math.max(phasePeakRssMb[memoryPhase] || 0, rssMb);
+  };
+  const setMemoryPhase = (phase) => {
+    memoryPhase = phase;
+    sampleMemory();
+  };
   const sampler = setInterval(() => {
-    peakRssMb = Math.max(peakRssMb, processSample(nodeRedPid)?.rssMb || 0);
+    sampleMemory();
   }, 20);
 
   try {
@@ -298,9 +320,11 @@ async function main() {
     deployedFlowId = deployedTabs[0].id;
     const deployMs = ms(deployStarted);
 
+    setMemoryPhase('browse-flow');
     const browse = await jsonRequest(`${adminUrl}${routeRoot}/browse`, 'POST', { count: pointCount });
     assert.equal(browse.points, pointCount);
 
+    setMemoryPhase('browse-editor-tree');
     const editorTree = await jsonRequest(`${adminUrl}/opcua-client/browse`, 'POST', {
       connectionId: flow.configs[0].id,
       rootNodeId: server.rootNodeId,
@@ -316,6 +340,7 @@ async function main() {
     assert.equal(selectedBrowse.source, 'browse-selection');
 
     const readLatencies = [];
+    setMemoryPhase('read');
     for (let round = 0; round < readRounds; round += 1) {
       const result = await jsonRequest(`${adminUrl}${routeRoot}/read`, 'POST', { count: pointCount });
       assert.equal(result.points, pointCount);
@@ -323,12 +348,19 @@ async function main() {
       readLatencies.push(result.elapsedMs);
     }
 
+    setMemoryPhase('subscribe');
     const subscription = await jsonRequest(`${adminUrl}${routeRoot}/subscribe`, 'POST', { count: pointCount });
     assert.equal(subscription.desired, pointCount);
     assert.equal(subscription.monitored, pointCount);
+    assert.equal(
+      subscription.subscriptionCount,
+      Math.ceil(pointCount / maxItemsPerSubscription),
+      'Point set was not sharded into the expected number of subscriptions'
+    );
 
     let reconnectRecovery = null;
     if (reconnectTest) {
+      setMemoryPhase('reconnect');
       await stopFixture(server);
       await new Promise((resolve) => setTimeout(resolve, 1000));
       server = await startFixture();
@@ -337,15 +369,44 @@ async function main() {
 
     const writeLatencies = [];
     let finalWrite;
+    setMemoryPhase('write-and-notify');
+    if (externalWriteTest) {
+      externalWriter = new OpcUaClient({
+        endpoint: server.endpoint,
+        securityMode: 'None',
+        requestTimeout: 10000,
+        nodeIdCacheSize: pointCount + 100,
+      });
+      await externalWriter.connect();
+    }
     for (let round = 0; round < writeRounds; round += 1) {
-      const result = await jsonRequest(`${adminUrl}${routeRoot}/write`, 'POST', { count: pointCount, round });
-      assert.equal(result.points, pointCount);
-      assert.equal(result.good, pointCount);
-      writeLatencies.push(result.elapsedMs);
-      finalWrite = result;
+      if (externalWriteTest) {
+        const floor = 1000000 + round * pointCount;
+        await jsonRequest(`${adminUrl}${routeRoot}/arm`, 'POST', { floor });
+        const writes = Array.from({ length: pointCount }, (_, index) => ({
+          nodeId: `ns=${server.namespace};s=Factory.Area${String(Math.floor(index / 500)).padStart(3, '0')}.Point${String(index).padStart(6, '0')}`,
+          value: floor + index,
+          dataType: 'Double',
+        }));
+        const started = performance.now();
+        const results = await externalWriter.writeMany(writes, batchSize);
+        const elapsedMs = ms(started);
+        assert.equal(results.length, pointCount);
+        assert.equal(results.filter((item) => item.statusCode === 'Good').length, pointCount);
+        writeLatencies.push(elapsedMs);
+        finalWrite = { clientDiagnostics: externalWriter.getDiagnostics() };
+      } else {
+        const result = await jsonRequest(`${adminUrl}${routeRoot}/write`, 'POST', { count: pointCount, round });
+        assert.equal(result.points, pointCount);
+        assert.equal(result.good, pointCount);
+        writeLatencies.push(result.elapsedMs);
+        finalWrite = result;
+      }
     }
 
+    setMemoryPhase('final-convergence');
     const subscriptionResult = await waitForFinal(pointCount);
+    setMemoryPhase('clear');
     await jsonRequest(`${adminUrl}${routeRoot}/clear`, 'POST', {});
     const endSample = processSample(nodeRedPid);
     const clockTicks = Number(spawnSync('getconf', ['CLK_TCK'], { encoding: 'utf8' }).stdout.trim()) || 100;
@@ -355,6 +416,7 @@ async function main() {
       points: pointCount,
       batchSize,
       rounds: { read: readRounds, write: writeRounds },
+      writeDriver: externalWriteTest ? 'external native client' : 'Node-RED CSV Write node',
       durationsMs: {
         deploy: deployMs,
         browse: browse.elapsedMs,
@@ -369,18 +431,21 @@ async function main() {
       editorTree: { nodes: editorTree.total, variables: countVariables(editorTree.tree) },
       selectedBrowse,
       reconnectRecovery,
-      clientDiagnostics: finalWrite?.clientDiagnostics,
+      clientDiagnostics: externalWriteTest ? undefined : finalWrite?.clientDiagnostics,
+      writerDiagnostics: externalWriteTest ? finalWrite?.clientDiagnostics : undefined,
       nodeRedProcess: {
         pid: nodeRedPid,
         rssBeforeMb: startSample?.rssMb,
         rssAfterMb: endSample?.rssMb,
         peakRssMb,
+        phasePeakRssMb,
         cpuMs: startSample && endSample ? Math.round(((endSample.ticks - startSample.ticks) / clockTicks) * 1000) : null,
       },
     }, null, 2));
     if (holdMs > 0) await new Promise((resolve) => setTimeout(resolve, holdMs));
   } finally {
     clearInterval(sampler);
+    if (externalWriter) await externalWriter.disconnect().catch(() => {});
     if (deployed) {
       try {
         if (!deployedFlowId) {

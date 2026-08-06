@@ -2,88 +2,222 @@
 
 const { messagePoints } = require('../lib/points');
 
+const NOTIFICATION_CONFIG_FIELDS = new Set([
+  'nodeId',
+  'samplingInterval',
+  'queueSize',
+  'discardOldest',
+  'deadbandType',
+  'deadbandValue',
+  'enabled',
+]);
+
+function positiveInteger(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
+}
+
 module.exports = function registerSubscribeNode(RED) {
   function OpcUaSubscribeNode(config) {
     RED.nodes.createNode(this, config);
     const node = this;
     node.connection = RED.nodes.getNode(config.connection);
-    node.subscriptionId = null;
+    node.subscriptions = new Map();
     node.desired = new Map();
     node.monitored = new Map();
+    node.subscriptionDiagnostics = new Map();
+    node.pendingChanges = [];
+    node.flushTimer = null;
     node.reconnectTimer = null;
     node.reconcileChain = Promise.resolve();
     node.reconcileAttempt = 0;
     node.lastSessionGeneration = 0;
-    node.lastRecoveryReason = '';
     node.closing = false;
-    node.lastDiagnostics = {};
     node.lastDropped = 0;
     node.lastStatusAt = 0;
 
-    const batchSize = Number(config.batchSize) || 500;
+    const batchSize = positiveInteger(config.batchSize, 500);
+    const callbackBatchSize = positiveInteger(config.callbackBatchSize, 500);
+    const callbackFlushIntervalMs = positiveInteger(config.callbackFlushIntervalMs, 50);
+    const configuredSubscriptionCapacity = positiveInteger(config.maxItemsPerSubscription, 5000);
 
-    function emitBatch(batch) {
-      const diagnostics = batch.diagnostics || {};
-      const results = batch.changes || [];
-      for (const change of results) {
-        const point = node.desired.get(change.nodeId);
-        if (!point) continue;
-        for (const key in point) {
-          if (!Object.hasOwn(change, key)) change[key] = point[key];
-        }
+    function subscriptionIds() {
+      return [...node.subscriptions.keys()];
+    }
+
+    function primarySubscriptionId() {
+      return subscriptionIds()[0] ?? null;
+    }
+
+    function subscriptionCapacity() {
+      const diagnostics = node.connection?.client.getDiagnostics?.() || {};
+      const serverLimit = Number(
+        diagnostics.operationLimits?.maxMonitoredItemsPerSubscription
+      );
+      return Number.isFinite(serverLimit) && serverLimit > 0
+        ? Math.min(configuredSubscriptionCapacity, Math.floor(serverLimit))
+        : configuredSubscriptionCapacity;
+    }
+
+    function combinedDiagnostics() {
+      const output = {
+        queueDepth: 0,
+        queueCapacity: 0,
+        maxQueueDepth: 0,
+        enqueued: 0,
+        delivered: 0,
+        dropped: 0,
+        coalesced: 0,
+        batches: 0,
+        maxLagMs: 0,
+        subscriptionCount: node.subscriptions.size,
+        mode: config.queueMode || 'all',
+        overflowPolicy: config.overflowPolicy || 'drop-oldest',
+      };
+      for (const diagnostics of node.subscriptionDiagnostics.values()) {
+        output.queueDepth += Number(diagnostics.queueDepth) || 0;
+        output.queueCapacity += Number(diagnostics.queueCapacity) || 0;
+        output.maxQueueDepth += Number(diagnostics.maxQueueDepth) || 0;
+        output.enqueued += Number(diagnostics.enqueued) || 0;
+        output.delivered += Number(diagnostics.delivered) || 0;
+        output.dropped += Number(diagnostics.dropped) || 0;
+        output.coalesced += Number(diagnostics.coalesced) || 0;
+        output.batches += Number(diagnostics.batchSequence) || 0;
+        output.maxLagMs = Math.max(output.maxLagMs, Number(diagnostics.maxLagMs) || 0);
       }
-      node.lastDiagnostics = diagnostics;
+      return output;
+    }
+
+    function updateQueueWarning(diagnostics) {
       const dropped = Number(diagnostics.dropped) || 0;
       if (dropped > node.lastDropped) {
         node.warn(`OPC UA notification queue dropped ${dropped - node.lastDropped} change(s); total ${dropped}`);
       }
       node.lastDropped = dropped;
+    }
 
-      if (results.length) {
-        if ((config.outputMode || 'batch') === 'batch') {
-          node.send({
-            payload: results,
-            opcua: { operation: 'change', total: results.length, queue: diagnostics },
-          });
-        } else {
-          results.forEach((result, index) => node.send({
-            topic: result.nodeId,
-            payload: result.value,
-            opcua: index === 0 ? { ...result, queue: diagnostics } : result,
-          }));
+    function sendBatch(changes) {
+      let accepted = 0;
+      for (let index = 0; index < changes.length; index += 1) {
+        if (node.desired.has(changes[index].nodeId)) {
+          changes[accepted] = changes[index];
+          accepted += 1;
         }
+      }
+      changes.length = accepted;
+      if (!changes.length || node.closing) return;
+      const diagnostics = combinedDiagnostics();
+      updateQueueWarning(diagnostics);
+      node.send({
+        payload: changes,
+        opcua: {
+          operation: 'change',
+          total: changes.length,
+          subscriptionCount: node.subscriptions.size,
+          queue: diagnostics,
+        },
+      });
+    }
+
+    function clearFlushTimer() {
+      if (node.flushTimer) clearTimeout(node.flushTimer);
+      node.flushTimer = null;
+    }
+
+    function scheduleFlush() {
+      if (node.flushTimer || !node.pendingChanges.length || node.closing) return;
+      node.flushTimer = setTimeout(() => {
+        node.flushTimer = null;
+        while (node.pendingChanges.length) {
+          sendBatch(node.pendingChanges.splice(0, callbackBatchSize));
+        }
+      }, callbackFlushIntervalMs);
+      node.flushTimer.unref?.();
+    }
+
+    function flushFullBatches() {
+      while (node.pendingChanges.length >= callbackBatchSize) {
+        sendBatch(node.pendingChanges.splice(0, callbackBatchSize));
+      }
+      if (!node.pendingChanges.length) clearFlushTimer();
+      else scheduleFlush();
+    }
+
+    function discardPendingChanges() {
+      clearFlushTimer();
+      node.pendingChanges.length = 0;
+    }
+
+    function onNativeBatch(record, batch) {
+      if (node.closing || !record.id || !node.subscriptions.has(record.id)) return;
+      const diagnostics = batch.diagnostics || {};
+      node.subscriptionDiagnostics.set(record.id, diagnostics);
+      const sourceChanges = batch.changes || [];
+      const changes = [];
+      for (let index = 0; index < sourceChanges.length; index += 1) {
+        const change = sourceChanges[index];
+        const point = node.desired.get(change.nodeId);
+        if (!point) continue;
+        change.subscriptionId = record.id;
+        for (const key in point) {
+          if (!NOTIFICATION_CONFIG_FIELDS.has(key) && !Object.hasOwn(change, key)) {
+            change[key] = point[key];
+          }
+        }
+        changes.push(change);
+      }
+
+      if ((config.outputMode || 'batch') === 'single') {
+        const queue = combinedDiagnostics();
+        updateQueueWarning(queue);
+        changes.forEach((change, index) => node.send({
+          topic: change.nodeId,
+          payload: change.value,
+          opcua: index === 0 ? { ...change, queue } : change,
+        }));
+      } else if (changes.length) {
+        node.pendingChanges.push(...changes);
+        flushFullBatches();
+        scheduleFlush();
       }
 
       const now = Date.now();
-      if (dropped > 0 || now - node.lastStatusAt >= 1000) {
+      const queue = combinedDiagnostics();
+      if (queue.dropped > 0 || now - node.lastStatusAt >= 1000) {
         node.lastStatusAt = now;
         node.status({
-          fill: dropped > 0 ? 'yellow' : 'green',
-          shape: dropped > 0 ? 'ring' : 'dot',
-          text: `${node.monitored.size} monitored q:${diagnostics.queueDepth || 0}/${diagnostics.queueCapacity || 0}`,
+          fill: queue.dropped > 0 ? 'yellow' : 'green',
+          shape: queue.dropped > 0 ? 'ring' : 'dot',
+          text: `${node.monitored.size} monitored / ${node.subscriptions.size} sub q:${queue.queueDepth}/${queue.queueCapacity}`,
         });
       }
     }
 
-    async function ensureSubscription() {
-      if (node.subscriptionId != null) return;
+    async function createSubscription() {
+      const record = {
+        id: null,
+        monitored: new Map(),
+        limit: subscriptionCapacity(),
+      };
       const result = await node.connection.client.createSubscription({
         publishingInterval: Number(config.publishingInterval) || 1000,
         lifetimeCount: Number(config.lifetimeCount) || 120,
         maxKeepAliveCount: Number(config.maxKeepAliveCount) || 10,
         maxNotificationsPerPublish: Number(config.maxNotificationsPerPublish) || 0,
-        callbackQueueSize: Number(config.callbackQueueSize) || 10000,
-        callbackBatchSize: Number(config.callbackBatchSize) || 500,
+        callbackQueueSize: positiveInteger(config.callbackQueueSize, 10000),
+        callbackBatchSize,
         queueMode: config.queueMode || 'all',
         overflowPolicy: config.overflowPolicy || 'drop-oldest',
-      }, emitBatch);
-      node.subscriptionId = result.subscriptionId;
+      }, (batch) => onNativeBatch(record, batch));
+      record.id = result.subscriptionId;
+      node.subscriptions.set(record.id, record);
+      return record;
     }
 
-    async function createMonitoredItems(points) {
+    async function addMonitoredItems(record, points) {
       if (!points.length) return [];
       const results = await node.connection.client.addMonitoredItems(
-        node.subscriptionId,
+        record.id,
         points,
         {
           samplingInterval: Number(config.samplingInterval) || 1000,
@@ -91,70 +225,177 @@ module.exports = function registerSubscribeNode(RED) {
           discardOldest: config.discardOldest !== false,
           deadbandType: config.deadbandType || 'none',
           deadbandValue: Number(config.deadbandValue) || 0,
+          timestampMode: config.timestampMode || 'source',
         },
         batchSize
       );
       results.forEach((result) => {
-        if (result.statusCode === 'Good') node.monitored.set(result.nodeId, result.monitoredItemId);
+        result.subscriptionId = record.id;
+        if (result.statusCode !== 'Good') return;
+        const monitored = {
+          subscriptionId: record.id,
+          monitoredItemId: result.monitoredItemId,
+          clientHandle: result.clientHandle,
+        };
+        record.monitored.set(result.nodeId, monitored);
+        node.monitored.set(result.nodeId, monitored);
       });
       return results;
     }
 
-    async function reconcileSubscription(reason = 'state') {
-      if (node.closing) return;
-      if (!node.desired.size) {
-        if (node.subscriptionId != null) await clearSubscription(true);
-        return;
-      }
+    function findAvailableSubscription() {
+      return [...node.subscriptions.values()].find(
+        (record) => record.monitored.size < record.limit
+      );
+    }
 
-      let rebuilt = false;
-      if (node.subscriptionId != null) {
-        const validation = await node.connection.client.validateSubscription(node.subscriptionId);
-        if (!validation.valid) {
-          try {
-            await node.connection.client.deleteSubscription(node.subscriptionId);
-          } catch {}
-          node.subscriptionId = null;
-          node.monitored.clear();
-          rebuilt = true;
+    async function addDesiredPoints(points) {
+      const remaining = [...points];
+      const failures = [];
+      while (remaining.length) {
+        const record = findAvailableSubscription() || await createSubscription();
+        const room = Math.max(0, record.limit - record.monitored.size);
+        if (!room) continue;
+        const candidates = remaining.splice(0, room);
+        const byNodeId = new Map(candidates.map((point) => [point.nodeId, point]));
+        const results = await addMonitoredItems(record, candidates);
+        const returnedNodeIds = new Set(results.map((result) => result.nodeId));
+        for (const point of candidates) {
+          if (!returnedNodeIds.has(point.nodeId)) {
+            failures.push({ nodeId: point.nodeId, statusCode: 'BadUnexpectedError' });
+          }
+        }
+        const capacityFailures = [];
+        results.forEach((result) => {
+          if (result.statusCode === 'Good') return;
+          const point = byNodeId.get(result.nodeId);
+          if (/TooManyMonitoredItems/i.test(result.statusCode) && point) {
+            capacityFailures.push(point);
+          } else failures.push(result);
+        });
+        if (capacityFailures.length) {
+          if (record.monitored.size === 0) {
+            failures.push(...capacityFailures.map((point) => ({
+              nodeId: point.nodeId,
+              statusCode: 'BadTooManyMonitoredItems',
+            })));
+          } else {
+            record.limit = record.monitored.size;
+            remaining.unshift(...capacityFailures);
+          }
         }
       }
+      return failures;
+    }
 
-      await ensureSubscription();
-      const removals = [];
-      for (const [nodeId, monitoredItemId] of node.monitored) {
-        if (!node.desired.has(nodeId)) removals.push({ nodeId, monitoredItemId });
+    async function removeUndesiredPoints() {
+      const grouped = new Map();
+      for (const [nodeId, monitored] of node.monitored) {
+        if (node.desired.has(nodeId)) continue;
+        if (!grouped.has(monitored.subscriptionId)) grouped.set(monitored.subscriptionId, []);
+        grouped.get(monitored.subscriptionId).push({ nodeId, ...monitored });
       }
-      if (removals.length) {
+      for (const [subscriptionId, removals] of grouped) {
+        const record = node.subscriptions.get(subscriptionId);
+        if (!record) continue;
         const results = await node.connection.client.removeMonitoredItems(
-          node.subscriptionId,
+          subscriptionId,
           removals.map((item) => item.monitoredItemId),
           batchSize
         );
         results.forEach((result, index) => {
-          if (result.statusCode === 'Good') node.monitored.delete(removals[index].nodeId);
+          if (result.statusCode !== 'Good') return;
+          const nodeId = removals[index].nodeId;
+          record.monitored.delete(nodeId);
+          node.monitored.delete(nodeId);
         });
       }
+    }
 
+    async function pruneEmptySubscriptions() {
+      const empty = [...node.subscriptions.values()].filter(
+        (record) => record.monitored.size === 0
+      );
+      for (const record of empty) {
+        if (node.subscriptions.size <= 1 && node.desired.size > 0) break;
+        node.subscriptions.delete(record.id);
+        node.subscriptionDiagnostics.delete(record.id);
+        await node.connection.client.deleteSubscription(record.id);
+      }
+    }
+
+    async function clearSubscriptions(keepDesired = false, ignoreErrors = false) {
+      if (!keepDesired) node.desired.clear();
+      discardPendingChanges();
+      const records = [...node.subscriptions.values()];
+      node.subscriptions.clear();
+      node.monitored.clear();
+      node.subscriptionDiagnostics.clear();
+      const results = await Promise.allSettled(
+        records.map((record) => node.connection.client.deleteSubscription(record.id))
+      );
+      if (!ignoreErrors) {
+        const rejected = results.find((result) => result.status === 'rejected');
+        if (rejected) throw rejected.reason;
+      }
+    }
+
+    async function validateSubscriptions() {
+      for (const record of node.subscriptions.values()) {
+        const validation = await node.connection.client.validateSubscription(record.id);
+        if (!validation.valid) return false;
+      }
+      return true;
+    }
+
+    function statusPayload(command, failed = 0) {
+      const ids = subscriptionIds();
+      return {
+        command,
+        desired: node.desired.size,
+        monitored: node.monitored.size,
+        failed,
+        subscriptionCount: ids.length,
+        subscriptionId: ids[0] ?? null,
+        subscriptionIds: ids,
+      };
+    }
+
+    async function reconcileSubscriptions(reason = 'state') {
+      if (node.closing) return;
+      if (!node.desired.size) {
+        if (node.subscriptions.size) await clearSubscriptions(true);
+        return;
+      }
+
+      let rebuilt = false;
+      if (node.subscriptions.size) {
+        let valid = false;
+        try { valid = await validateSubscriptions(); } catch {}
+        if (!valid) {
+          await clearSubscriptions(true, true);
+          rebuilt = true;
+        }
+      }
+
+      await removeUndesiredPoints();
       const additions = [...node.desired.values()].filter(
         (point) => !node.monitored.has(point.nodeId)
       );
-      const results = await createMonitoredItems(additions);
-      const failed = results.filter((result) => result.statusCode !== 'Good');
-      if (failed.length) throw new Error(`${failed.length} monitored item(s) failed to recover`);
+      const failures = await addDesiredPoints(additions);
+      await pruneEmptySubscriptions();
+      if (failures.length) {
+        throw new Error(`${failures.length} monitored item(s) failed to reconcile`);
+      }
 
       node.reconcileAttempt = 0;
-      node.status({ fill: 'green', shape: 'dot', text: `${node.monitored.size} monitored` });
+      node.status({
+        fill: 'green', shape: 'dot',
+        text: `${node.monitored.size} monitored / ${node.subscriptions.size} sub`,
+      });
       if (reason !== 'command') {
         node.send({
-          payload: {
-            command: 'recover',
-            desired: node.desired.size,
-            monitored: node.monitored.size,
-            subscriptionId: node.subscriptionId,
-            rebuilt,
-            reason,
-          },
+          payload: { ...statusPayload('recover'), rebuilt, reason },
           opcua: {
             operation: 'subscription-status',
             recovered: true,
@@ -167,19 +408,10 @@ module.exports = function registerSubscribeNode(RED) {
       }
     }
 
-    async function clearSubscription(keepDesired = false) {
-      if (!keepDesired) node.desired.clear();
-      if (node.subscriptionId != null) {
-        await node.connection.client.deleteSubscription(node.subscriptionId);
-      }
-      node.subscriptionId = null;
-      node.monitored.clear();
-    }
-
     async function replacePoints(points) {
       node.desired = new Map(points.map((point) => [point.nodeId, point]));
-      await clearSubscription(true);
-      await reconcileSubscription('command');
+      await clearSubscriptions(true);
+      await reconcileSubscriptions('command');
     }
 
     function runSerialized(task) {
@@ -193,17 +425,17 @@ module.exports = function registerSubscribeNode(RED) {
       const base = Math.max(100, Number(config.reconnectInterval) || 5000);
       const delay = immediate ? 0 : Math.min(30000, base * (2 ** node.reconcileAttempt));
       node.reconcileAttempt += 1;
-      node.lastRecoveryReason = reason;
       node.reconnectTimer = setTimeout(async () => {
         node.reconnectTimer = null;
         try {
-          await runSerialized(() => reconcileSubscription(reason));
+          await runSerialized(() => reconcileSubscriptions(reason));
         } catch (error) {
           node.warn(`OPC UA resubscribe failed: ${error.message}`);
           node.status({ fill: 'yellow', shape: 'ring', text: 'waiting to recover' });
           scheduleReconnect(reason);
         }
       }, delay);
+      node.reconnectTimer.unref?.();
     }
 
     const onFault = () => scheduleReconnect('service-fault');
@@ -215,7 +447,7 @@ module.exports = function registerSubscribeNode(RED) {
       if (state.state === 'connected') {
         scheduleReconnect(state.reason || 'connected', true);
       } else if (state.state === 'subscription-inactive' &&
-                 (!state.subscriptionId || state.subscriptionId === node.subscriptionId)) {
+                 (!state.subscriptionId || node.subscriptions.has(state.subscriptionId))) {
         node.status({ fill: 'yellow', shape: 'ring', text: 'subscription inactive' });
         scheduleReconnect('subscription-inactive');
       } else if (['reconnecting', 'backoff', 'failed'].includes(state.state)) {
@@ -240,23 +472,21 @@ module.exports = function registerSubscribeNode(RED) {
           if (command === 'replace') await replacePoints(points);
           else if (command === 'add') {
             points.forEach((point) => node.desired.set(point.nodeId, point));
-            await reconcileSubscription('command');
+            await reconcileSubscriptions('command');
           } else if (command === 'remove') {
             points.forEach((point) => node.desired.delete(point.nodeId));
-            await reconcileSubscription('command');
-          } else if (command === 'clear') await clearSubscription();
+            await reconcileSubscriptions('command');
+          } else if (command === 'clear') await clearSubscriptions();
           else throw new Error(`Unsupported subscription command: ${command}`);
         });
 
-        node.status({ fill: 'green', shape: 'dot', text: `${node.monitored.size} monitored` });
+        node.status({
+          fill: 'green', shape: 'dot',
+          text: `${node.monitored.size} monitored / ${node.subscriptions.size} sub`,
+        });
         send({
           ...msg,
-          payload: {
-            command,
-            desired: node.desired.size,
-            monitored: node.monitored.size,
-            subscriptionId: node.subscriptionId,
-          },
+          payload: statusPayload(command),
           opcua: { operation: 'subscription-status' },
         });
         done();
@@ -269,11 +499,12 @@ module.exports = function registerSubscribeNode(RED) {
     node.on('close', async (done) => {
       node.closing = true;
       if (node.reconnectTimer) clearTimeout(node.reconnectTimer);
+      discardPendingChanges();
       node.connection?.client.off('fault', onFault);
       node.connection?.client.off('state', onState);
       node.desired.clear();
       try {
-        await clearSubscription();
+        await clearSubscriptions();
       } catch (error) {
         node.warn(`OPC UA subscription cleanup failed: ${error.message}`);
       }

@@ -58,6 +58,15 @@ async function main() {
       {}
     );
     assert.equal(monitored[0].statusCode, 'Good');
+    const secondMonitoredBatch = await addon.addMonitoredItemsAsync(
+      clientId,
+      subscription.subscriptionId,
+      [{ nodeId: server.nodeId, samplingInterval: 100, queueSize: 10 }],
+      { timestampMode: 'neither' }
+    );
+    assert.equal(secondMonitoredBatch[0].statusCode, 'Good');
+    assert(monitored[0].clientHandle > 0);
+    assert(secondMonitoredBatch[0].clientHandle > monitored[0].clientHandle);
     const validation = await addon.validateSubscriptionAsync(
       clientId, subscription.subscriptionId
     );
@@ -72,13 +81,22 @@ async function main() {
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     assert(changes.some((change) => change.value === 42.5));
+    const sourceChange = changes.find((change) =>
+      change.value === 42.5 && change.clientHandle === monitored[0].clientHandle
+    );
+    const noTimestampChange = changes.find((change) =>
+      change.value === 42.5 && change.clientHandle === secondMonitoredBatch[0].clientHandle
+    );
+    assert.equal(sourceChange?.serverTimestamp, undefined);
+    assert.equal(noTimestampChange?.sourceTimestamp, undefined);
+    assert.equal(noTimestampChange?.serverTimestamp, undefined);
     assert(notificationBatches.some((batch) => Array.isArray(batch.changes)));
     assert(notificationBatches.every((batch) => (batch.diagnostics?.dropped || 0) === 0));
 
     await addon.removeMonitoredItemsAsync(
       clientId,
       subscription.subscriptionId,
-      [monitored[0].monitoredItemId]
+      [monitored[0].monitoredItemId, secondMonitoredBatch[0].monitoredItemId]
     );
     await addon.deleteSubscriptionAsync(clientId, subscription.subscriptionId);
     const diagnostics = addon.getClientDiagnostics(clientId);
@@ -87,6 +105,7 @@ async function main() {
       maxNodesPerWrite: 7,
       maxNodesPerBrowse: 7,
       maxMonitoredItemsPerCall: 7,
+      maxMonitoredItemsPerSubscription: 0,
     });
     assert(diagnostics.nodeIdCache.size > 0);
     assert.equal(diagnostics.nodeIdCache.size, 32);
@@ -94,6 +113,11 @@ async function main() {
     assert(diagnostics.nodeIdCache.hits > 0);
     assert(diagnostics.nodeIdCache.misses > 0);
     assert(diagnostics.nodeIdCache.evictions > 0);
+    assert.equal(diagnostics.commandQueue.depth, 0);
+    assert.equal(diagnostics.commandQueue.active, 0);
+    assert(diagnostics.commandQueue.enqueued > 0);
+    assert.equal(diagnostics.commandQueue.completed, diagnostics.commandQueue.enqueued);
+    assert.equal(diagnostics.commandQueue.rejected, 0);
     console.log(`native integration passed: browsed=${browsed.length}, changes=${changes.length}, cache=${JSON.stringify(diagnostics.nodeIdCache)}, limits=${JSON.stringify(diagnostics.operationLimits)}`);
   } finally {
     if (clientId != null) await addon.disconnectAsync(clientId);

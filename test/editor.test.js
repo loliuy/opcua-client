@@ -65,3 +65,19 @@ test('node editors compile and keep advanced settings collapsed by default', () 
     assert.doesNotThrow(() => new Function(scripts[0][1]));
   }
 });
+
+test('Subscribe editor exposes automatic sharding and dual-threshold batching', () => {
+  const html = read('nodes/subscribe.html');
+  assert.match(html, /id="node-input-maxItemsPerSubscription"/);
+  assert.match(html, /maxItemsPerSubscription: \{ value: 5000/);
+  assert.match(html, /id="node-input-callbackFlushIntervalMs"/);
+  assert.match(html, /callbackFlushIntervalMs: \{ value: 50/);
+  assert.match(html, /timestampMode: \{ value: 'source'/);
+  assert.match(html, /one or more OPC UA subscriptions/);
+});
+
+test('Connection editor exposes a bounded native command queue', () => {
+  const html = read('nodes/connection.html');
+  assert.match(html, /id="node-config-input-commandQueueSize"/);
+  assert.match(html, /commandQueueSize: \{ value: 256/);
+});
