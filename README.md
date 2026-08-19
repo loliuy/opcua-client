@@ -132,7 +132,36 @@ implemented policies, and selects an endpoint compatible with Anonymous or
 Username authentication. Certificate, private-key, trust-list, and CRL entries
 are filesystem paths visible to the Node-RED runtime.
 
-## Build
+## Offline installation
+
+The published package contains a prebuilt `linux-x64-musl` native addon for the
+Node-RED Alpine image, the pinned open62541 v1.4.16 source archive, and its
+`node-addon-api` build dependency. The same Node-API binary is verified on Node
+20.19.6 and Node 22.22.2. Installing the tarball on the supported target does
+not contact npm or GitHub and does not invoke a compiler:
+
+```bash
+npm install ./tier0-opcua-client-0.1.0.tgz --offline
+```
+
+The loader uses the bundled native addon directly. Set
+`OPCUA_CLIENT_FORCE_BUILD=1` only to force a source rebuild. Unsupported
+platforms fall back to the bundled open62541 source and therefore still require
+a local C/C++ toolchain, CMake, Python, Node headers, and OpenSSL development
+files. No network is needed for open62541 itself.
+
+Create the supported prebuild and package on Linux with:
+
+```bash
+npm ci --ignore-scripts
+npm run build:offline-prebuild -- --nodedir=/usr/local
+npm pack
+```
+
+See `THIRD_PARTY_NOTICES.md` for the bundled open62541 and node-addon-api
+licenses.
+
+## Source build
 
 Linux build prerequisites are a C/C++ compiler, CMake, Python, Git, and the
 OpenSSL development package.
@@ -142,7 +171,9 @@ npm install
 npm test
 ```
 
-`npm install` builds the pinned open62541 release first and then compiles the N-API addon. To rebuild only the native layer after changing C++ code, run `npm run build`.
+When no compatible prebuild is available, `npm install` builds the bundled
+open62541 release and then compiles the N-API addon. To rebuild only the native
+layer after changing C++ code, run `npm run build`.
 
 The open62541 build is static and position-independent so the resulting N-API addon does not need a runtime open62541 shared library.
 

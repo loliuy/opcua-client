@@ -16,13 +16,17 @@
     "nodes",
     "src",
     "scripts",
+    "prebuilds",
+    "vendor",
     "README.md",
     "BENCHMARK.md",
+    "THIRD_PARTY_NOTICES.md",
     "LICENSE"
   ],
   "scripts": {
-    "install": "npm run build:open62541 && node-gyp rebuild",
+    "install": "node scripts/install.js",
     "build:open62541": "bash scripts/build-open62541.sh",
+    "build:offline-prebuild": "bash scripts/build-offline-prebuild.sh",
     "build:test-server": "bash scripts/build-test-server.sh",
     "build": "node-gyp rebuild",
     "clean": "node-gyp clean",
@@ -30,9 +34,11 @@
     "test:native": "node test/native.integration.js && node test/native.queue.integration.js && node test/native.command-queue.integration.js && node test/reconnect.integration.js",
     "test:reconnect": "node test/reconnect.integration.js",
     "test:secure": "node test/secure.integration.js",
+    "test:offline-runtime": "node scripts/verify-runtime.js",
     "test:stress": "node test/stress.js",
     "test:nodered": "node test/nodered.integration.js",
-    "test:nodered:reconnect": "OPCUA_NODERED_RECONNECT=1 node test/nodered.integration.js"
+    "test:nodered:reconnect": "OPCUA_NODERED_RECONNECT=1 node test/nodered.integration.js",
+    "prepack": "node scripts/verify-offline-package.js"
   },
   "keywords": [
     "node-red",
@@ -57,6 +63,9 @@
   "dependencies": {
     "node-addon-api": "^8.3.1"
   },
+  "bundledDependencies": [
+    "node-addon-api"
+  ],
   "devDependencies": {
     "node-gyp": "^11.4.2"
   }

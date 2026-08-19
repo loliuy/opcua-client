@@ -95,11 +95,13 @@ OPC UA Server 节点不在本仓库范围内，继续使用独立容器。
 ### P0.6 npm 与 Enterprise 离线交付
 
 - [ ] 发布 `@tier0/opcua-client`。
-- [ ] 离线包携带固定版本 open62541 源码或预编译产物，安装时不访问 GitHub。
+- [x] npm 离线包携带 Linux x64 musl 预编译插件、固定版本 open62541 源码和 node-addon-api，支持断网安装且不访问 GitHub。
 - [ ] Enterprise `packages.txt` 改为离线 tgz。
 - [ ] 更新 palette 隐藏逻辑，识别 `@tier0/opcua-client` 和 `tier0-opcua-*`。
 - [ ] 更新 Node-RED 镜像编译依赖和安装/升级回归。
 - [ ] 验证全新安装、升级安装、失败后再次运行 `bin/nodered-packages.sh`。
+
+2026-08-19 阶段验证：生成约 5 MB 的 `@tier0/opcua-client@0.1.0` 离线 tgz，包含 `linux-x64-musl` N-API 预编译模块、open62541 `v1.4.16` 完整源码与 MPL-2.0 许可证、捆绑的 node-addon-api。使用 `--network none` 和空 npm cache，分别在 Node-RED 4.1.2 / Node 20.19.6 与 Node-RED 4.1.10 / Node 22.22.2 Alpine 容器中完成 `npm install --offline` 和原生导出加载验证，未执行编译或联网。
 
 ## P1：原版常用能力
 
