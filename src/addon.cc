@@ -13,7 +13,9 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <fstream>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -34,6 +36,78 @@ std::string StatusName(UA_StatusCode status) {
 
 std::string UaString(const UA_String& value) {
   return value.data ? std::string(reinterpret_cast<const char*>(value.data), value.length) : "";
+}
+
+std::string SecurityPolicyUri(const std::string& policy) {
+  if (policy == "None" ||
+      policy == "http://opcfoundation.org/UA/SecurityPolicy#None") {
+    return "http://opcfoundation.org/UA/SecurityPolicy#None";
+  }
+  if (policy == "Basic256Sha256" ||
+      policy == "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256") {
+    return "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256";
+  }
+  return "";
+}
+
+UA_MessageSecurityMode SecurityMode(const std::string& mode) {
+  if (mode == "None") return UA_MESSAGESECURITYMODE_NONE;
+  if (mode == "Sign") return UA_MESSAGESECURITYMODE_SIGN;
+  if (mode == "SignAndEncrypt") return UA_MESSAGESECURITYMODE_SIGNANDENCRYPT;
+  return UA_MESSAGESECURITYMODE_INVALID;
+}
+
+std::string SecurityModeName(UA_MessageSecurityMode mode) {
+  if (mode == UA_MESSAGESECURITYMODE_NONE) return "None";
+  if (mode == UA_MESSAGESECURITYMODE_SIGN) return "Sign";
+  if (mode == UA_MESSAGESECURITYMODE_SIGNANDENCRYPT) return "SignAndEncrypt";
+  return "Invalid";
+}
+
+bool LoadFile(const std::string& path, UA_ByteString* output, std::string* error) {
+  UA_ByteString_init(output);
+  std::ifstream stream(path, std::ios::binary | std::ios::ate);
+  if (!stream) {
+    *error = "Cannot open OPC UA security file: " + path;
+    return false;
+  }
+  const std::streamoff end = stream.tellg();
+  if (end <= 0) {
+    *error = "OPC UA security file is empty: " + path;
+    return false;
+  }
+  const size_t size = static_cast<size_t>(end);
+  if (!UA_StatusCode_isGood(UA_ByteString_allocBuffer(output, size))) {
+    *error = "Cannot allocate OPC UA security file buffer for: " + path;
+    return false;
+  }
+  stream.seekg(0, std::ios::beg);
+  stream.read(reinterpret_cast<char*>(output->data), static_cast<std::streamsize>(size));
+  if (!stream) {
+    UA_ByteString_clear(output);
+    *error = "Cannot read OPC UA security file: " + path;
+    return false;
+  }
+  return true;
+}
+
+void ClearByteStrings(std::vector<UA_ByteString>* values) {
+  for (auto& value : *values) UA_ByteString_clear(&value);
+  values->clear();
+}
+
+bool LoadFiles(const std::vector<std::string>& paths, std::vector<UA_ByteString>* output,
+               std::string* error) {
+  output->reserve(paths.size());
+  for (const auto& path : paths) {
+    UA_ByteString value;
+    if (!LoadFile(path, &value, error)) {
+      ClearByteStrings(output);
+      return false;
+    }
+    output->push_back(value);
+  }
+  return true;
 }
 
 std::string NodeIdString(const UA_NodeId& node_id) {
@@ -205,6 +279,83 @@ bool JsScalarToVariant(Napi::Env env, const Napi::Value& input, const std::strin
   return false;
 }
 
+bool FlattenJsArray(Napi::Env env, const Napi::Value& input, size_t depth,
+                    std::vector<uint32_t>* dimensions,
+                    std::vector<Napi::Value>* values, size_t* leaf_depth) {
+  if (!input.IsArray()) {
+    if (*leaf_depth == std::numeric_limits<size_t>::max()) *leaf_depth = depth;
+    if (*leaf_depth != depth) {
+      Napi::TypeError::New(env, "OPC UA array value must be rectangular").ThrowAsJavaScriptException();
+      return false;
+    }
+    values->push_back(input);
+    return true;
+  }
+  Napi::Array array = input.As<Napi::Array>();
+  if (array.Length() == 0) {
+    Napi::TypeError::New(env, "OPC UA array value must not be empty").ThrowAsJavaScriptException();
+    return false;
+  }
+  if (dimensions->size() == depth) dimensions->push_back(array.Length());
+  else if ((*dimensions)[depth] != array.Length()) {
+    Napi::TypeError::New(env, "OPC UA array value must be rectangular").ThrowAsJavaScriptException();
+    return false;
+  }
+  for (uint32_t index = 0; index < array.Length(); ++index) {
+    if (!FlattenJsArray(env, array.Get(index), depth + 1, dimensions, values, leaf_depth)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool JsValueToVariant(Napi::Env env, const Napi::Value& input, const std::string& name,
+                      UA_Variant* output) {
+  if (!input.IsArray()) return JsScalarToVariant(env, input, name, output);
+  const UA_DataType* type = DataTypeByName(name);
+  if (!type) {
+    Napi::TypeError::New(env, "Unsupported OPC UA data type: " + name).ThrowAsJavaScriptException();
+    return false;
+  }
+  std::vector<uint32_t> dimensions;
+  std::vector<Napi::Value> values;
+  size_t leaf_depth = std::numeric_limits<size_t>::max();
+  if (!FlattenJsArray(env, input, 0, &dimensions, &values, &leaf_depth)) return false;
+  void* data = UA_Array_new(values.size(), type);
+  if (!data) {
+    Napi::Error::New(env, "Failed to allocate OPC UA array value").ThrowAsJavaScriptException();
+    return false;
+  }
+  for (size_t index = 0; index < values.size(); ++index) {
+    UA_Variant scalar;
+    if (!JsScalarToVariant(env, values[index], name, &scalar)) {
+      UA_Variant_clear(&scalar);
+      UA_Array_delete(data, values.size(), type);
+      return false;
+    }
+    void* target = static_cast<char*>(data) + index * type->memSize;
+    const UA_StatusCode status = UA_copy(scalar.data, target, type);
+    UA_Variant_clear(&scalar);
+    if (!UA_StatusCode_isGood(status)) {
+      UA_Array_delete(data, values.size(), type);
+      Napi::Error::New(env, "Failed to copy OPC UA array value").ThrowAsJavaScriptException();
+      return false;
+    }
+  }
+  UA_Variant_init(output);
+  UA_Variant_setArray(output, data, values.size(), type);
+  output->arrayDimensions = static_cast<UA_UInt32*>(
+      UA_Array_new(dimensions.size(), &UA_TYPES[UA_TYPES_UINT32]));
+  if (!output->arrayDimensions) {
+    UA_Variant_clear(output);
+    Napi::Error::New(env, "Failed to allocate OPC UA array dimensions").ThrowAsJavaScriptException();
+    return false;
+  }
+  output->arrayDimensionsSize = dimensions.size();
+  std::copy(dimensions.begin(), dimensions.end(), output->arrayDimensions);
+  return true;
+}
+
 std::string GetString(const Napi::Object& object, const char* name, const std::string& fallback = "") {
   if (!object.Has(name)) return fallback;
   Napi::Value value = object.Get(name);
@@ -302,6 +453,11 @@ struct ClientCommand {
 
 struct ClientContext {
   UA_Client* client = nullptr;
+  std::string endpoint;
+  std::string security_mode;
+  std::string security_policy_uri;
+  std::string identity_type;
+  std::string private_key_password;
   std::atomic<bool> running{false};
   std::thread iterate_thread;
   std::mutex command_mutex;
@@ -340,6 +496,18 @@ struct ClientContext {
   std::atomic<uint64_t> disconnect_count{0};
   std::atomic<uint64_t> session_generation{0};
 };
+
+#ifdef UA_ENABLE_ENCRYPTION
+UA_StatusCode PrivateKeyPasswordCallback(UA_ClientConfig* config, UA_ByteString* password) {
+  auto* context = static_cast<ClientContext*>(config ? config->clientContext : nullptr);
+  if (!context || context->private_key_password.empty()) {
+    return UA_STATUSCODE_BADSECURITYCHECKSFAILED;
+  }
+  *password = UA_BYTESTRING_ALLOC(context->private_key_password.c_str());
+  return password->length == context->private_key_password.size()
+    ? UA_STATUSCODE_GOOD : UA_STATUSCODE_BADOUTOFMEMORY;
+}
+#endif
 
 struct ClientStateEvent {
   std::string state;
@@ -859,6 +1027,118 @@ class PromiseWorker : public Napi::AsyncWorker {
   Napi::Promise::Deferred deferred_;
 };
 
+std::string UserTokenTypeName(UA_UserTokenType type) {
+  if (type == UA_USERTOKENTYPE_ANONYMOUS) return "Anonymous";
+  if (type == UA_USERTOKENTYPE_USERNAME) return "Username";
+  if (type == UA_USERTOKENTYPE_CERTIFICATE) return "Certificate";
+  if (type == UA_USERTOKENTYPE_ISSUEDTOKEN) return "IssuedToken";
+  return "Unknown";
+}
+
+struct DiscoveredUserToken {
+  std::string policy_id;
+  std::string token_type;
+  std::string security_policy_uri;
+  std::string issued_token_type;
+  std::string issuer_endpoint_url;
+};
+
+struct DiscoveredEndpoint {
+  std::string endpoint_url;
+  std::string security_mode;
+  std::string security_policy_uri;
+  std::string server_application_uri;
+  std::string product_uri;
+  uint8_t security_level = 0;
+  std::vector<DiscoveredUserToken> user_identity_tokens;
+};
+
+class DiscoverEndpointsWorker : public PromiseWorker {
+ public:
+  DiscoverEndpointsWorker(Napi::Promise::Deferred deferred, std::string endpoint,
+                          uint32_t timeout)
+      : PromiseWorker(deferred), endpoint_(std::move(endpoint)), timeout_(timeout) {}
+
+  void Execute() override {
+    if (endpoint_.empty()) { SetError("OPC UA endpoint is required"); return; }
+    UA_Client* client = UA_Client_new();
+    if (!client) { SetError("Failed to create open62541 discovery client"); return; }
+    UA_ClientConfig* config = UA_Client_getConfig(client);
+    config->timeout = timeout_;
+    size_t endpoint_count = 0;
+    UA_EndpointDescription* endpoints = nullptr;
+    const UA_StatusCode status = UA_Client_getEndpoints(
+        client, endpoint_.c_str(), &endpoint_count, &endpoints);
+    if (UA_StatusCode_isGood(status)) {
+      endpoints_.reserve(endpoint_count);
+      for (size_t index = 0; index < endpoint_count; ++index) {
+        const UA_EndpointDescription& source = endpoints[index];
+        DiscoveredEndpoint target;
+        target.endpoint_url = UaString(source.endpointUrl);
+        target.security_mode = SecurityModeName(source.securityMode);
+        target.security_policy_uri = UaString(source.securityPolicyUri);
+        target.server_application_uri = UaString(source.server.applicationUri);
+        target.product_uri = UaString(source.server.productUri);
+        target.security_level = source.securityLevel;
+        target.user_identity_tokens.reserve(source.userIdentityTokensSize);
+        for (size_t token_index = 0; token_index < source.userIdentityTokensSize;
+             ++token_index) {
+          const UA_UserTokenPolicy& token = source.userIdentityTokens[token_index];
+          target.user_identity_tokens.push_back({
+            UaString(token.policyId),
+            UserTokenTypeName(token.tokenType),
+            UaString(token.securityPolicyUri),
+            UaString(token.issuedTokenType),
+            UaString(token.issuerEndpointUrl),
+          });
+        }
+        endpoints_.push_back(std::move(target));
+      }
+    }
+    if (endpoints) {
+      UA_Array_delete(endpoints, endpoint_count, &UA_TYPES[UA_TYPES_ENDPOINTDESCRIPTION]);
+    }
+    UA_Client_delete(client);
+    if (!UA_StatusCode_isGood(status)) {
+      SetError("GetEndpoints failed: " + StatusName(status));
+    }
+  }
+
+  void OnOK() override {
+    Napi::Array output = Napi::Array::New(Env(), endpoints_.size());
+    for (size_t index = 0; index < endpoints_.size(); ++index) {
+      const auto& endpoint = endpoints_[index];
+      Napi::Object value = Napi::Object::New(Env());
+      value.Set("endpointUrl", endpoint.endpoint_url);
+      value.Set("securityMode", endpoint.security_mode);
+      value.Set("securityPolicyUri", endpoint.security_policy_uri);
+      value.Set("securityLevel", endpoint.security_level);
+      value.Set("serverApplicationUri", endpoint.server_application_uri);
+      value.Set("productUri", endpoint.product_uri);
+      Napi::Array tokens = Napi::Array::New(Env(), endpoint.user_identity_tokens.size());
+      for (size_t token_index = 0; token_index < endpoint.user_identity_tokens.size();
+           ++token_index) {
+        const auto& token = endpoint.user_identity_tokens[token_index];
+        Napi::Object token_value = Napi::Object::New(Env());
+        token_value.Set("policyId", token.policy_id);
+        token_value.Set("tokenType", token.token_type);
+        token_value.Set("securityPolicyUri", token.security_policy_uri);
+        token_value.Set("issuedTokenType", token.issued_token_type);
+        token_value.Set("issuerEndpointUrl", token.issuer_endpoint_url);
+        tokens.Set(token_index, token_value);
+      }
+      value.Set("userIdentityTokens", tokens);
+      output.Set(index, value);
+    }
+    deferred_.Resolve(output);
+  }
+
+ private:
+  std::string endpoint_;
+  uint32_t timeout_;
+  std::vector<DiscoveredEndpoint> endpoints_;
+};
+
 class ClientCommandWorker : public PromiseWorker {
  public:
   ClientCommandWorker(Napi::Promise::Deferred deferred,
@@ -880,6 +1160,12 @@ struct ConnectionOptions {
   std::string security_policy;
   std::string user;
   std::string password;
+  std::string certificate;
+  std::string private_key;
+  std::string private_key_password;
+  std::string application_uri;
+  std::vector<std::string> trusted_certificates;
+  std::vector<std::string> revocation_list;
   uint32_t timeout = 10000;
   uint32_t session_timeout = 60000;
   uint32_t connectivity_check_interval = 5000;
@@ -896,10 +1182,36 @@ class ConnectWorker : public PromiseWorker {
         has_state_callback_(has_state_callback) {}
   void Execute() override {
     if (options_.endpoint.empty()) { SetError("OPC UA endpoint is required"); return; }
-    if (!options_.security_mode.empty() && options_.security_mode != "None") {
-      SetError("Sign and SignAndEncrypt require an encryption-enabled open62541 build"); return;
+    const UA_MessageSecurityMode security_mode = SecurityMode(options_.security_mode);
+    const std::string security_policy_uri = SecurityPolicyUri(options_.security_policy);
+    const bool policy_none = security_policy_uri ==
+      "http://opcfoundation.org/UA/SecurityPolicy#None";
+    if (security_mode == UA_MESSAGESECURITYMODE_INVALID) {
+      SetError("Unsupported OPC UA security mode: " + options_.security_mode); return;
+    }
+    if (security_policy_uri.empty()) {
+      SetError("Unsupported OPC UA security policy: " + options_.security_policy); return;
+    }
+    if (security_mode == UA_MESSAGESECURITYMODE_NONE && !policy_none) {
+      SetError("SecurityMode None requires SecurityPolicy None"); return;
+    }
+    if (security_mode != UA_MESSAGESECURITYMODE_NONE) {
+      if (policy_none) {
+        SetError(options_.security_mode + " requires a non-None security policy"); return;
+      }
+      if (options_.certificate.empty() || options_.private_key.empty()) {
+        SetError("Secure OPC UA connections require a client certificate and private key"); return;
+      }
+      if (options_.trusted_certificates.empty()) {
+        SetError("Secure OPC UA connections require at least one trusted server or CA certificate"); return;
+      }
     }
     context_ = std::make_shared<ClientContext>();
+    context_->endpoint = options_.endpoint;
+    context_->security_mode = options_.security_mode;
+    context_->security_policy_uri = security_policy_uri;
+    context_->identity_type = options_.user.empty() ? "Anonymous" : "Username";
+    context_->private_key_password = options_.private_key_password;
     context_->state_callback = state_callback_;
     context_->has_state_callback.store(has_state_callback_);
     context_->node_id_cache_capacity = options_.node_id_cache_size;
@@ -933,7 +1245,60 @@ class ConnectWorker : public PromiseWorker {
     context_->client = UA_Client_new();
     if (!context_->client) { SetError("Failed to create open62541 client"); return; }
     UA_ClientConfig* config = UA_Client_getConfig(context_->client);
-    UA_ClientConfig_setDefault(config);
+    const UA_MessageSecurityMode security_mode = SecurityMode(options_.security_mode);
+    const std::string security_policy_uri = SecurityPolicyUri(options_.security_policy);
+    UA_StatusCode config_status = UA_STATUSCODE_GOOD;
+    if (security_mode == UA_MESSAGESECURITYMODE_NONE) {
+      config_status = UA_ClientConfig_setDefault(config);
+    } else {
+#ifdef UA_ENABLE_ENCRYPTION
+      UA_ByteString certificate;
+      UA_ByteString private_key;
+      std::vector<UA_ByteString> trust_list;
+      std::vector<UA_ByteString> revocation_list;
+      std::string file_error;
+      if (!LoadFile(options_.certificate, &certificate, &file_error)) {
+        SetError(file_error); return;
+      }
+      if (!LoadFile(options_.private_key, &private_key, &file_error)) {
+        UA_ByteString_clear(&certificate);
+        SetError(file_error); return;
+      }
+      if (!LoadFiles(options_.trusted_certificates, &trust_list, &file_error) ||
+          !LoadFiles(options_.revocation_list, &revocation_list, &file_error)) {
+        UA_ByteString_clear(&certificate);
+        UA_ByteString_clear(&private_key);
+        ClearByteStrings(&trust_list);
+        ClearByteStrings(&revocation_list);
+        SetError(file_error); return;
+      }
+      config->clientContext = context_.get();
+      config->privateKeyPasswordCallback = PrivateKeyPasswordCallback;
+      config_status = UA_ClientConfig_setDefaultEncryption(
+          config, certificate, private_key,
+          trust_list.data(), trust_list.size(),
+          revocation_list.data(), revocation_list.size());
+      std::fill(context_->private_key_password.begin(),
+                context_->private_key_password.end(), '\0');
+      context_->private_key_password.clear();
+      UA_ByteString_clear(&certificate);
+      UA_ByteString_clear(&private_key);
+      ClearByteStrings(&trust_list);
+      ClearByteStrings(&revocation_list);
+#else
+      SetError("The native open62541 addon was built without encryption support"); return;
+#endif
+    }
+    if (!UA_StatusCode_isGood(config_status)) {
+      SetError("Configure OPC UA security failed: " + StatusName(config_status)); return;
+    }
+    config->securityMode = security_mode;
+    UA_String_clear(&config->securityPolicyUri);
+    config->securityPolicyUri = UA_STRING_ALLOC(security_policy_uri.c_str());
+    if (!options_.application_uri.empty()) {
+      UA_String_clear(&config->clientDescription.applicationUri);
+      config->clientDescription.applicationUri = UA_STRING_ALLOC(options_.application_uri.c_str());
+    }
     config->timeout = options_.timeout;
     config->requestedSessionTimeout = options_.session_timeout;
     config->connectivityCheckInterval = options_.connectivity_check_interval;
@@ -973,11 +1338,16 @@ class DisconnectWorker : public PromiseWorker {
   uint64_t client_id_;
 };
 
+struct ReadInput {
+  std::string node_id;
+  std::string index_range;
+};
+
 class ReadManyWorker : public ClientCommandWorker {
  public:
   ReadManyWorker(Napi::Promise::Deferred deferred, std::shared_ptr<ClientContext> context,
-                 std::vector<std::string> node_ids)
-      : ClientCommandWorker(deferred, std::move(context)), node_ids_(std::move(node_ids)) {
+                 std::vector<ReadInput> inputs)
+      : ClientCommandWorker(deferred, std::move(context)), inputs_(std::move(inputs)) {
     UA_ReadResponse_init(&response_);
   }
   ~ReadManyWorker() override { UA_ReadResponse_clear(&response_); }
@@ -985,14 +1355,20 @@ class ReadManyWorker : public ClientCommandWorker {
     UA_ReadRequest request;
     UA_ReadRequest_init(&request);
     request.timestampsToReturn = UA_TIMESTAMPSTORETURN_BOTH;
-    request.nodesToReadSize = node_ids_.size();
-    request.nodesToRead = static_cast<UA_ReadValueId*>(UA_Array_new(node_ids_.size(), &UA_TYPES[UA_TYPES_READVALUEID]));
+    request.nodesToReadSize = inputs_.size();
+    request.nodesToRead = static_cast<UA_ReadValueId*>(UA_Array_new(inputs_.size(), &UA_TYPES[UA_TYPES_READVALUEID]));
     if (!request.nodesToRead) { SetError("Failed to allocate batch read request"); return; }
-    for (size_t index = 0; index < node_ids_.size(); ++index) {
-      if (!CopyCachedNodeId(context_.get(), node_ids_[index], &request.nodesToRead[index].nodeId)) {
-        UA_ReadRequest_clear(&request); SetError("Invalid NodeId: " + node_ids_[index]); return;
+    for (size_t index = 0; index < inputs_.size(); ++index) {
+      if (!CopyCachedNodeId(context_.get(), inputs_[index].node_id, &request.nodesToRead[index].nodeId)) {
+        UA_ReadRequest_clear(&request); SetError("Invalid NodeId: " + inputs_[index].node_id); return;
       }
       request.nodesToRead[index].attributeId = UA_ATTRIBUTEID_VALUE;
+      if (!inputs_[index].index_range.empty()) {
+        request.nodesToRead[index].indexRange = UA_STRING_ALLOC(inputs_[index].index_range.c_str());
+        if (!request.nodesToRead[index].indexRange.data) {
+          UA_ReadRequest_clear(&request); SetError("Failed to allocate IndexRange"); return;
+        }
+      }
     }
     if (!context_->client) { UA_ReadRequest_clear(&request); SetError("Client disconnected"); return; }
     response_ = UA_Client_Service_read(context_->client, request);
@@ -1002,10 +1378,11 @@ class ReadManyWorker : public ClientCommandWorker {
     }
   }
   void OnOK() override {
-    Napi::Array output = Napi::Array::New(Env(), node_ids_.size());
-    for (size_t index = 0; index < node_ids_.size(); ++index) {
+    Napi::Array output = Napi::Array::New(Env(), inputs_.size());
+    for (size_t index = 0; index < inputs_.size(); ++index) {
       Napi::Object item = Napi::Object::New(Env());
-      item.Set("nodeId", node_ids_[index]);
+      item.Set("nodeId", inputs_[index].node_id);
+      if (!inputs_[index].index_range.empty()) item.Set("indexRange", inputs_[index].index_range);
       if (index < response_.resultsSize) {
         const UA_DataValue& value = response_.results[index];
         item.Set("statusCode", StatusName(value.status));
@@ -1018,13 +1395,14 @@ class ReadManyWorker : public ClientCommandWorker {
     deferred_.Resolve(output);
   }
  private:
-  std::vector<std::string> node_ids_;
+  std::vector<ReadInput> inputs_;
   UA_ReadResponse response_;
 };
 
 struct WriteInput {
   std::string node_id;
   std::string data_type;
+  std::string index_range;
   UA_Variant value;
   WriteInput() { UA_Variant_init(&value); }
   ~WriteInput() { UA_Variant_clear(&value); }
@@ -1050,6 +1428,12 @@ class WriteManyWorker : public ClientCommandWorker {
         UA_WriteRequest_clear(&request); SetError("Invalid NodeId: " + inputs_[index]->node_id); return;
       }
       target.attributeId = UA_ATTRIBUTEID_VALUE;
+      if (!inputs_[index]->index_range.empty()) {
+        target.indexRange = UA_STRING_ALLOC(inputs_[index]->index_range.c_str());
+        if (!target.indexRange.data) {
+          UA_WriteRequest_clear(&request); SetError("Failed to allocate IndexRange"); return;
+        }
+      }
       target.value.hasValue = true;
       UA_Variant_copy(&inputs_[index]->value, &target.value.value);
     }
@@ -1065,6 +1449,7 @@ class WriteManyWorker : public ClientCommandWorker {
     for (size_t index = 0; index < inputs_.size(); ++index) {
       Napi::Object item = Napi::Object::New(Env());
       item.Set("nodeId", inputs_[index]->node_id);
+      if (!inputs_[index]->index_range.empty()) item.Set("indexRange", inputs_[index]->index_range);
       item.Set("statusCode", index < response_.resultsSize ? StatusName(response_.results[index]) : "BadUnexpectedError");
       output.Set(index, item);
     }
@@ -1487,6 +1872,10 @@ Napi::Value GetClientDiagnostics(const Napi::CallbackInfo& info) {
   connection.Set("reconnectCount", Napi::Number::New(env, static_cast<double>(context->reconnect_count.load())));
   connection.Set("disconnectCount", Napi::Number::New(env, static_cast<double>(context->disconnect_count.load())));
   connection.Set("sessionGeneration", Napi::Number::New(env, static_cast<double>(context->session_generation.load())));
+  connection.Set("endpoint", context->endpoint);
+  connection.Set("securityMode", context->security_mode);
+  connection.Set("securityPolicyUri", context->security_policy_uri);
+  connection.Set("identityType", context->identity_type);
   result.Set("connection", connection);
 
   size_t command_queue_depth = 0;
@@ -1526,7 +1915,9 @@ Napi::Value GetClientDiagnostics(const Napi::CallbackInfo& info) {
 Napi::Value ConnectAsync(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env(); if (info.Length() < 1 || !info[0].IsObject()) { Napi::TypeError::New(env, "Connection options are required").ThrowAsJavaScriptException(); return env.Undefined(); }
   Napi::Object object = info[0].As<Napi::Object>(); ConnectionOptions options;
-  options.endpoint = GetString(object, "endpoint"); options.security_mode = GetString(object, "securityMode", "None"); options.security_policy = GetString(object, "securityPolicy", "None"); options.user = GetString(object, "user"); options.password = GetString(object, "password"); options.timeout = GetUInt(object, "requestTimeout", 10000); options.session_timeout = GetUInt(object, "requestedSessionTimeout", 60000); options.connectivity_check_interval = GetUInt(object, "connectivityCheckInterval", 5000); options.node_id_cache_size = GetUInt(object, "nodeIdCacheSize", 100000); options.command_queue_size = GetUInt(object, "commandQueueSize", 256);
+  options.endpoint = GetString(object, "endpoint"); options.security_mode = GetString(object, "securityMode", "None"); options.security_policy = GetString(object, "securityPolicy", "None"); options.user = GetString(object, "user"); options.password = GetString(object, "password"); options.certificate = GetString(object, "certificate"); options.private_key = GetString(object, "privateKey"); options.private_key_password = GetString(object, "privateKeyPassword"); options.application_uri = GetString(object, "applicationUri"); options.timeout = GetUInt(object, "requestTimeout", 10000); options.session_timeout = GetUInt(object, "requestedSessionTimeout", 60000); options.connectivity_check_interval = GetUInt(object, "connectivityCheckInterval", 5000); options.node_id_cache_size = GetUInt(object, "nodeIdCacheSize", 100000); options.command_queue_size = GetUInt(object, "commandQueueSize", 256);
+  if (object.Has("trustedCertificates") && object.Get("trustedCertificates").IsArray()) { Napi::Array values = object.Get("trustedCertificates").As<Napi::Array>(); for (uint32_t index = 0; index < values.Length(); ++index) if (values.Get(index).IsString()) options.trusted_certificates.push_back(values.Get(index).As<Napi::String>().Utf8Value()); }
+  if (object.Has("revocationList") && object.Get("revocationList").IsArray()) { Napi::Array values = object.Get("revocationList").As<Napi::Array>(); for (uint32_t index = 0; index < values.Length(); ++index) if (values.Get(index).IsString()) options.revocation_list.push_back(values.Get(index).As<Napi::String>().Utf8Value()); }
   bool has_state_callback = info.Length() > 1 && info[1].IsFunction();
   Napi::ThreadSafeFunction state_callback;
   if (has_state_callback) {
@@ -1536,17 +1927,30 @@ Napi::Value ConnectAsync(const Napi::CallbackInfo& info) {
   auto deferred = Napi::Promise::Deferred::New(env); (new ConnectWorker(deferred, std::move(options), std::move(state_callback), has_state_callback))->Queue(); return deferred.Promise();
 }
 
+Napi::Value DiscoverEndpointsAsync(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (info.Length() < 1 || !info[0].IsObject()) {
+    Napi::TypeError::New(env, "Discovery options are required").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  Napi::Object options = info[0].As<Napi::Object>();
+  auto deferred = Napi::Promise::Deferred::New(env);
+  (new DiscoverEndpointsWorker(
+      deferred, GetString(options, "endpoint"), GetUInt(options, "requestTimeout", 10000)))->Queue();
+  return deferred.Promise();
+}
+
 Napi::Value DisconnectAsync(const Napi::CallbackInfo& info) { Napi::Env env = info.Env(); uint64_t id = info[0].As<Napi::Number>().Int64Value(); auto deferred = Napi::Promise::Deferred::New(env); (new DisconnectWorker(deferred, id))->Queue(); return deferred.Promise(); }
 
 Napi::Value ReadManyAsync(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env(); auto context = RequireClient(env, info[0]); if (!context || !info[1].IsArray()) return env.Undefined(); Napi::Array array = info[1].As<Napi::Array>(); std::vector<std::string> ids; ids.reserve(array.Length());
-  for (uint32_t index = 0; index < array.Length(); ++index) { Napi::Value value = array.Get(index); ids.push_back(value.IsString() ? value.As<Napi::String>().Utf8Value() : GetString(value.As<Napi::Object>(), "nodeId")); }
-  auto deferred = Napi::Promise::Deferred::New(env); (new ReadManyWorker(deferred, context, std::move(ids)))->Queue(); return deferred.Promise();
+  Napi::Env env = info.Env(); auto context = RequireClient(env, info[0]); if (!context || !info[1].IsArray()) return env.Undefined(); Napi::Array array = info[1].As<Napi::Array>(); std::vector<ReadInput> inputs; inputs.reserve(array.Length());
+  for (uint32_t index = 0; index < array.Length(); ++index) { Napi::Value value = array.Get(index); ReadInput input; if (value.IsString()) input.node_id = value.As<Napi::String>().Utf8Value(); else { Napi::Object object = value.As<Napi::Object>(); input.node_id = GetString(object, "nodeId"); input.index_range = GetString(object, "indexRange"); } inputs.push_back(std::move(input)); }
+  auto deferred = Napi::Promise::Deferred::New(env); (new ReadManyWorker(deferred, context, std::move(inputs)))->Queue(); return deferred.Promise();
 }
 
 Napi::Value WriteManyAsync(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env(); auto context = RequireClient(env, info[0]); if (!context || !info[1].IsArray()) return env.Undefined(); Napi::Array array = info[1].As<Napi::Array>(); std::vector<std::unique_ptr<WriteInput>> inputs;
-  for (uint32_t index = 0; index < array.Length(); ++index) { Napi::Object object = array.Get(index).As<Napi::Object>(); auto input = std::make_unique<WriteInput>(); input->node_id = GetString(object, "nodeId"); input->data_type = GetString(object, "dataType", "String"); if (!object.Has("value")) { Napi::TypeError::New(env, "Write point is missing value").ThrowAsJavaScriptException(); return env.Undefined(); } if (!JsScalarToVariant(env, object.Get("value"), input->data_type, &input->value)) return env.Undefined(); inputs.push_back(std::move(input)); }
+  for (uint32_t index = 0; index < array.Length(); ++index) { Napi::Object object = array.Get(index).As<Napi::Object>(); auto input = std::make_unique<WriteInput>(); input->node_id = GetString(object, "nodeId"); input->data_type = GetString(object, "dataType", "String"); input->index_range = GetString(object, "indexRange"); if (!object.Has("value")) { Napi::TypeError::New(env, "Write point is missing value").ThrowAsJavaScriptException(); return env.Undefined(); } if (!JsValueToVariant(env, object.Get("value"), input->data_type, &input->value)) return env.Undefined(); inputs.push_back(std::move(input)); }
   auto deferred = Napi::Promise::Deferred::New(env); (new WriteManyWorker(deferred, context, std::move(inputs)))->Queue(); return deferred.Promise();
 }
 
@@ -1582,6 +1986,7 @@ Napi::Value ValidateSubscriptionAsync(const Napi::CallbackInfo& info) { Napi::En
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("connectAsync", Napi::Function::New(env, ConnectAsync)); exports.Set("disconnectAsync", Napi::Function::New(env, DisconnectAsync));
+  exports.Set("discoverEndpointsAsync", Napi::Function::New(env, DiscoverEndpointsAsync));
   exports.Set("getClientDiagnostics", Napi::Function::New(env, GetClientDiagnostics));
   exports.Set("browseAsync", Napi::Function::New(env, BrowseAsync)); exports.Set("readManyAsync", Napi::Function::New(env, ReadManyAsync)); exports.Set("writeManyAsync", Napi::Function::New(env, WriteManyAsync));
   exports.Set("createSubscriptionAsync", Napi::Function::New(env, CreateSubscriptionAsync)); exports.Set("addMonitoredItemsAsync", Napi::Function::New(env, AddMonitoredItemsAsync)); exports.Set("removeMonitoredItemsAsync", Napi::Function::New(env, RemoveMonitoredItemsAsync)); exports.Set("deleteSubscriptionAsync", Napi::Function::New(env, DeleteSubscriptionAsync)); exports.Set("validateSubscriptionAsync", Napi::Function::New(env, ValidateSubscriptionAsync));

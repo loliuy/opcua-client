@@ -504,7 +504,7 @@ module.exports = function registerSubscribeNode(RED) {
       node.connection?.client.off('state', onState);
       node.desired.clear();
       try {
-        await clearSubscriptions();
+        await runSerialized(() => clearSubscriptions());
       } catch (error) {
         node.warn(`OPC UA subscription cleanup failed: ${error.message}`);
       }

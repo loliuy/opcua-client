@@ -23,11 +23,13 @@
   "scripts": {
     "install": "npm run build:open62541 && node-gyp rebuild",
     "build:open62541": "bash scripts/build-open62541.sh",
+    "build:test-server": "bash scripts/build-test-server.sh",
     "build": "node-gyp rebuild",
     "clean": "node-gyp clean",
     "test": "node --test test/*.test.js",
     "test:native": "node test/native.integration.js && node test/native.queue.integration.js && node test/native.command-queue.integration.js && node test/reconnect.integration.js",
     "test:reconnect": "node test/reconnect.integration.js",
+    "test:secure": "node test/secure.integration.js",
     "test:stress": "node test/stress.js",
     "test:nodered": "node test/nodered.integration.js",
     "test:nodered:reconnect": "OPCUA_NODERED_RECONNECT=1 node test/nodered.integration.js"

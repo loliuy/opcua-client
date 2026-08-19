@@ -2,18 +2,27 @@
   .opcua-advanced { margin: 8px 0 12px; }
   .opcua-advanced summary { cursor: pointer; font-weight: 600; padding: 6px 0; }
   .opcua-standard-note { margin: 0 0 10px 105px; color: var(--red-ui-form-text-color, #666); font-size: 0.9em; }
+  .opcua-discovery-result { margin: 6px 0 8px 105px; max-width: 70%; }
+  .opcua-discovery-result select { width: 100%; }
 </style>
 <script type="text/html" data-template-name="tier0-opcua-connection">
   <div class="form-row"><label for="node-config-input-endpoint">Endpoint</label><input type="text" id="node-config-input-endpoint" placeholder="opc.tcp://127.0.0.1:4840"></div>
+  <div class="form-row"><label></label><button type="button" class="red-ui-button" id="node-config-input-discoverEndpoints">Discover endpoints</button> <button type="button" class="red-ui-button" id="node-config-input-testConnection">Test connection</button></div>
+  <div class="opcua-discovery-result" id="node-config-input-discoveryResult" style="display:none"><select id="node-config-input-discoveredEndpoint"></select></div>
+  <div class="opcua-standard-note" id="node-config-input-testResult"></div>
   <div class="form-row"><label for="node-config-input-securityMode">Security</label><select id="node-config-input-securityMode"><option value="None">None</option><option value="Sign">Sign</option><option value="SignAndEncrypt">SignAndEncrypt</option></select></div>
   <div class="opcua-standard-note">Standard defaults include automatic reconnect, connectivity checks, and bounded command/NodeId queues.</div>
   <details class="opcua-advanced">
     <summary>Security and advanced connection settings</summary>
-    <div class="form-row"><label for="node-config-input-securityPolicy">Policy</label><select id="node-config-input-securityPolicy"><option value="None">None</option><option value="Basic256Sha256">Basic256Sha256</option><option value="Aes128Sha256RsaOaep">Aes128Sha256RsaOaep</option><option value="Aes256Sha256RsaPss">Aes256Sha256RsaPss</option></select></div>
+    <div class="form-row"><label for="node-config-input-securityPolicy">Policy</label><select id="node-config-input-securityPolicy"><option value="None">None</option><option value="Basic256Sha256">Basic256Sha256</option></select></div>
     <div class="form-row"><label for="node-config-input-user">User</label><input type="text" id="node-config-input-user"></div>
     <div class="form-row"><label for="node-config-input-password">Password</label><input type="password" id="node-config-input-password"></div>
-    <div class="form-row"><label for="node-config-input-certificate">Certificate</label><input type="text" id="node-config-input-certificate"></div>
-    <div class="form-row"><label for="node-config-input-privateKey">Private key</label><input type="text" id="node-config-input-privateKey"></div>
+    <div class="form-row opcua-secure-field"><label for="node-config-input-certificate">Client certificate</label><input type="text" id="node-config-input-certificate" placeholder="/path/to/client.der"></div>
+    <div class="form-row opcua-secure-field"><label for="node-config-input-privateKey">Client private key</label><input type="text" id="node-config-input-privateKey" placeholder="/path/to/client-key.pem"></div>
+    <div class="form-row opcua-secure-field"><label for="node-config-input-privateKeyPassword">Key password</label><input type="password" id="node-config-input-privateKeyPassword"></div>
+    <div class="form-row opcua-secure-field"><label for="node-config-input-applicationUri">Application URI</label><input type="text" id="node-config-input-applicationUri" placeholder="Must match the client certificate"></div>
+    <div class="form-row opcua-secure-field"><label for="node-config-input-trustedCertificates">Trusted certificates</label><textarea id="node-config-input-trustedCertificates" rows="3" placeholder="One Server or CA certificate path per line"></textarea></div>
+    <div class="form-row opcua-secure-field"><label for="node-config-input-revocationList">Revocation list</label><textarea id="node-config-input-revocationList" rows="2" placeholder="Optional CRL path, one per line"></textarea></div>
     <div class="form-row"><label for="node-config-input-requestedSessionTimeout">Session timeout</label><input type="number" id="node-config-input-requestedSessionTimeout"></div>
     <div class="form-row"><label for="node-config-input-requestTimeout">Request timeout</label><input type="number" id="node-config-input-requestTimeout"></div>
     <div class="form-row"><label for="node-config-input-connectivityCheckInterval">Connectivity check</label><input type="number" id="node-config-input-connectivityCheckInterval"></div>
@@ -31,6 +40,7 @@
       endpoint: { value: '', required: true },
       securityMode: { value: 'None' }, securityPolicy: { value: 'None' },
       user: { value: '' }, certificate: { value: '' }, privateKey: { value: '' },
+      applicationUri: { value: '' }, trustedCertificates: { value: '' }, revocationList: { value: '' },
       requestedSessionTimeout: { value: 60000, validate: RED.validators.number() },
       requestTimeout: { value: 10000, validate: RED.validators.number() },
       connectivityCheckInterval: { value: 5000, validate: RED.validators.number() },
@@ -40,7 +50,154 @@
       commandQueueSize: { value: 256, validate: RED.validators.number() },
       name: { value: '' }
     },
-    credentials: { password: { type: 'password' } },
-    label: function () { return this.name || this.endpoint || 'tier0-opcua-connection'; }
+    credentials: {
+      password: { type: 'password' },
+      privateKeyPassword: { type: 'password' }
+    },
+    label: function () { return this.name || this.endpoint || 'tier0-opcua-connection'; },
+    oneditprepare: function () {
+      const connectionId = this.id;
+      const mode = $('#node-config-input-securityMode');
+      const policy = $('#node-config-input-securityPolicy');
+      const result = $('#node-config-input-discoveryResult');
+      const discovered = $('#node-config-input-discoveredEndpoint');
+      const policyName = function (uri) {
+        return String(uri || '').split('#').pop() || 'None';
+      };
+      const updateSecurityFields = function () {
+        const secure = mode.val() !== 'None';
+        $('.opcua-secure-field').toggle(secure);
+        if (!secure) policy.val('None');
+        else if (policy.val() === 'None') policy.val('Basic256Sha256');
+      };
+      mode.on('change', updateSecurityFields);
+      updateSecurityFields();
+
+      const connectionSettings = function () {
+        return {
+          connectionId,
+          endpoint: String($('#node-config-input-endpoint').val() || '').trim(),
+          securityMode: mode.val(),
+          securityPolicy: policy.val(),
+          user: $('#node-config-input-user').val(),
+          password: $('#node-config-input-password').val(),
+          certificate: $('#node-config-input-certificate').val(),
+          privateKey: $('#node-config-input-privateKey').val(),
+          privateKeyPassword: $('#node-config-input-privateKeyPassword').val(),
+          applicationUri: $('#node-config-input-applicationUri').val(),
+          trustedCertificates: $('#node-config-input-trustedCertificates').val(),
+          revocationList: $('#node-config-input-revocationList').val(),
+          requestedSessionTimeout: $('#node-config-input-requestedSessionTimeout').val(),
+          requestTimeout: $('#node-config-input-requestTimeout').val(),
+          connectivityCheckInterval: $('#node-config-input-connectivityCheckInterval').val(),
+          reconnectInterval: $('#node-config-input-reconnectInterval').val(),
+          maxReconnectInterval: $('#node-config-input-maxReconnectInterval').val(),
+          nodeIdCacheSize: $('#node-config-input-nodeIdCacheSize').val(),
+          commandQueueSize: $('#node-config-input-commandQueueSize').val()
+        };
+      };
+
+      $('#node-config-input-discoverEndpoints').on('click', function () {
+        const button = $(this);
+        const endpoint = String($('#node-config-input-endpoint').val() || '').trim();
+        if (!endpoint) {
+          RED.notify('Enter an OPC UA endpoint first', 'warning');
+          return;
+        }
+        button.prop('disabled', true).text('Discovering...');
+        $.ajax({
+          url: 'opcua-client/endpoints',
+          method: 'POST',
+          contentType: 'application/json',
+          data: JSON.stringify({
+            endpoint,
+            requestTimeout: Number($('#node-config-input-requestTimeout').val()) || 10000
+          })
+        }).done(function (response) {
+          const allEndpoints = Array.isArray(response.endpoints) ? response.endpoints : [];
+          const identityType = String($('#node-config-input-user').val() || '').trim()
+            ? 'Username' : 'Anonymous';
+          const supported = allEndpoints.filter(function (item) {
+            const itemPolicy = policyName(item.securityPolicyUri);
+            return itemPolicy === 'None' || itemPolicy === 'Basic256Sha256';
+          });
+          const matchingIdentity = supported.filter(function (item) {
+            return (item.userIdentityTokens || []).some(function (token) {
+              return token.tokenType === identityType;
+            });
+          });
+          const endpoints = matchingIdentity.length ? matchingIdentity : supported;
+          discovered.empty();
+          endpoints.sort(function (left, right) {
+            return Number(right.securityLevel || 0) - Number(left.securityLevel || 0);
+          }).forEach(function (item, index) {
+            const identities = (item.userIdentityTokens || []).map(function (token) {
+              return token.tokenType;
+            }).filter(function (value, tokenIndex, values) {
+              return values.indexOf(value) === tokenIndex;
+            }).join(', ');
+            $('<option></option>')
+              .val(String(index))
+              .text(`${item.securityMode} / ${policyName(item.securityPolicyUri)} / ${identities || 'No identity token'}`)
+              .data('endpoint', item)
+              .appendTo(discovered);
+          });
+          if (!endpoints.length) {
+            RED.notify('The server returned no supported None or Basic256Sha256 endpoint', 'warning');
+            result.hide();
+            return;
+          }
+          if (!matchingIdentity.length) {
+            RED.notify(`No endpoint advertises ${identityType}; showing other supported endpoints`, 'warning');
+          }
+          result.show();
+          discovered.trigger('change');
+        }).fail(function (xhr) {
+          RED.notify(xhr.responseJSON?.error || 'Endpoint discovery failed', 'error');
+          result.hide();
+        }).always(function () {
+          button.prop('disabled', false).text('Discover endpoints');
+        });
+      });
+
+      discovered.on('change', function () {
+        const selected = discovered.find(':selected').data('endpoint');
+        if (!selected) return;
+        const selectedPolicy = policyName(selected.securityPolicyUri);
+        mode.val(selected.securityMode);
+        if (selectedPolicy === 'None' || selectedPolicy === 'Basic256Sha256') {
+          policy.val(selectedPolicy);
+        }
+        updateSecurityFields();
+      });
+
+      $('#node-config-input-testConnection').on('click', function () {
+        const button = $(this);
+        const testResult = $('#node-config-input-testResult');
+        const settings = connectionSettings();
+        if (!settings.endpoint) {
+          RED.notify('Enter an OPC UA endpoint first', 'warning');
+          return;
+        }
+        button.prop('disabled', true).text('Testing...');
+        testResult.text('');
+        $.ajax({
+          url: 'opcua-client/test-connection',
+          method: 'POST',
+          contentType: 'application/json',
+          data: JSON.stringify(settings)
+        }).done(function (response) {
+          const connection = response.connection || {};
+          testResult.text(`Connected: ${connection.securityMode || settings.securityMode} / ${policyName(connection.securityPolicyUri)}`);
+          RED.notify('OPC UA connection test succeeded', 'success');
+        }).fail(function (xhr) {
+          const message = xhr.responseJSON?.error || 'OPC UA connection test failed';
+          testResult.text(message);
+          RED.notify(message, 'error');
+        }).always(function () {
+          button.prop('disabled', false).text('Test connection');
+        });
+      });
+    }
   });
 </script>

@@ -39,6 +39,7 @@
   <details class="opcua-advanced">
     <summary>Advanced settings</summary>
     <div class="form-row"><label for="node-input-dataType">Default type</label><select id="node-input-dataType"><option>String</option><option>Boolean</option><option>SByte</option><option>Byte</option><option>Int16</option><option>UInt16</option><option>Int32</option><option>UInt32</option><option>Int64</option><option>UInt64</option><option>Float</option><option>Double</option><option>DateTime</option><option>ByteString</option></select></div>
+    <div class="form-row"><label for="node-input-indexRange">Index range</label><input type="text" id="node-input-indexRange" placeholder="For example 0 or 2:5"></div>
     <div class="form-row"><label for="node-input-batchSize">Batch size</label><input type="number" id="node-input-batchSize"></div>
     <div class="form-row"><label for="node-input-outputMode">Output</label><select id="node-input-outputMode"><option value="batch">Batch</option><option value="split">One message per point</option></select></div>
   </details>
@@ -47,6 +48,7 @@
 <script type="text/html" data-help-name="tier0-opcua-write">
   <p>Add NodeId, value, and data type rows or import JSON/CSV. Imported points are parsed and shown in the same list.</p>
   <p>CSV requires <code>nodeId</code> and <code>value</code>; <code>dataType</code> is optional. A JSON/CSV point list may also arrive dynamically in <code>msg.payload</code>.</p>
+  <p>Use <code>indexRange</code> (or legacy <code>range</code>) per point or in <code>msg.indexRange</code> for partial array writes.</p>
 </script>
 <script type="text/javascript">
   RED.nodes.registerType('tier0-opcua-write', {
@@ -54,6 +56,7 @@
     defaults: {
       connection: { value: '', type: 'tier0-opcua-connection', required: true },
       nodeId: { value: '' }, dataType: { value: 'String' },
+      indexRange: { value: '' },
       pointList: { value: '' }, pointListFileName: { value: '' },
       batchSize: { value: 500, validate: RED.validators.number() },
       outputMode: { value: 'batch' }, name: { value: '' }

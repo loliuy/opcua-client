@@ -6,8 +6,8 @@ High-scale OPC UA client nodes for Node-RED, backed by open62541 and designed fo
 
 - `tier0-opcua-connection`: shared client session and credentials.
 - `tier0-opcua-browse`: recursive Browse plus a searchable, selectable address-space tree.
-- `tier0-opcua-read`: scalar-compatible batch Read with a manual/imported point list.
-- `tier0-opcua-write`: scalar-compatible batch Write with a manual/imported point list.
+- `tier0-opcua-read`: scalar/array batch Read with optional IndexRange and a manual/imported point list.
+- `tier0-opcua-write`: scalar/array/matrix batch Write with optional IndexRange and a manual/imported point list.
 - `tier0-opcua-subscribe`: one or more automatically sharded Subscriptions with many MonitoredItems.
 
 The OPC UA server remains a separate service. This package contains client and collection nodes only.
@@ -80,6 +80,29 @@ ns=2;s=Line1.Speed,1200,Double
 ns=2;s=Line1.Enabled,true,Boolean
 ```
 
+## Arrays and IndexRange
+
+Read and Write descriptors accept the standard OPC UA `indexRange` field. The
+legacy `range` spelling is normalized to `indexRange`. One-dimensional examples
+are `0` and `2:5`; matrix ranges use a comma, for example `0:1,2:3`. Invalid or
+descending ranges are rejected before an OPC UA service call.
+
+Write values may be scalar JavaScript values, arrays, or rectangular nested
+arrays. Nested arrays are converted to OPC UA matrix dimensions; ragged or empty
+arrays are rejected. A direct array payload is treated as the value when the
+message or Write node identifies one target NodeId. A configured single
+`useInput` point behaves the same way. Set `msg.opcua.pointList = true` only when
+an array payload must be forced to mean a dynamic list of point descriptors.
+
+```json
+{
+  "topic": "ns=2;s=Recipe.Steps",
+  "indexRange": "4:6",
+  "dataType": "Double",
+  "payload": [12.5, 13.0, 13.5]
+}
+```
+
 An incoming point list takes priority over the point list saved in the node. Existing flows that stored a single static NodeId are migrated into the visible list when their editor is opened. A migrated Write item keeps using its incoming `msg.payload`; imported Write rows normally carry `nodeId`, `value`, and optional `dataType`.
 
 ## Browse tree selection
@@ -90,9 +113,29 @@ The selected Variable descriptors are saved with the Browse node. Each input mes
 
 Node editors show only the standard settings by default. Connection security/timeouts/cache, Browse limits/paging, Read/Write batching/output, and Subscribe queue/deadband tuning remain available under a closed **Advanced settings** section. Existing flows retain their stored advanced values.
 
+## Secure connections
+
+Connection nodes support `None/None` and `Sign` or `SignAndEncrypt` with
+`Basic256Sha256`. Secure connections require a client certificate, its private
+key, and at least one trusted Server or CA certificate. Trust is strict: an
+empty trust list is rejected instead of silently accepting every Server
+certificate. Optional CRL files can be supplied as a newline-separated list.
+Password-protected PEM private keys use the separate Node-RED credential field,
+so the password is not stored in the normal Flow configuration.
+
+The client Application URI can be configured when the URI embedded in the
+client certificate differs from the open62541 default. Username authentication
+uses the selected secure endpoint and its advertised UserTokenPolicy.
+
+The Connection editor can call `GetEndpoints`, filters the response to the
+implemented policies, and selects an endpoint compatible with Anonymous or
+Username authentication. Certificate, private-key, trust-list, and CRL entries
+are filesystem paths visible to the Node-RED runtime.
+
 ## Build
 
-Linux build prerequisites are a C/C++ compiler, CMake, Python, and Git.
+Linux build prerequisites are a C/C++ compiler, CMake, Python, Git, and the
+OpenSSL development package.
 
 ```bash
 npm install
@@ -103,7 +146,9 @@ npm test
 
 The open62541 build is static and position-independent so the resulting N-API addon does not need a runtime open62541 shared library.
 
-Security mode `None` is supported in the first implementation slice. Sign and SignAndEncrypt are visible in the connection model but require an encryption-enabled open62541 build and certificate trust-store integration before production use.
+The pinned open62541 build uses its OpenSSL encryption backend. The initial
+secure policy scope intentionally excludes deprecated Basic128Rsa15 and
+Basic256 policies.
 
 ## Native integration test
 
@@ -114,6 +159,31 @@ python3 -m venv .build/test-venv
 .build/test-venv/bin/pip install opcua==0.98.13
 PATH="$PWD/.build/test-venv/bin:$PATH" npm run test:native
 ```
+
+The Python fixture is used for the general native suite but does not implement
+OPC UA IndexRange semantics. Build the included open62541 test Server to verify
+real partial array reads and writes:
+
+```bash
+npm run build:test-server
+OPCUA_TEST_SERVER_BINARY="$PWD/build/open62541-test-server" \
+node test/native.integration.js
+```
+
+Run the secure integration test against a real Server after placing its
+certificate in the trust list:
+
+```bash
+OPCUA_SECURE_ENDPOINT=opc.tcp://server:4840 \
+OPCUA_CLIENT_CERTIFICATE=/pki/client.der \
+OPCUA_CLIENT_PRIVATE_KEY=/pki/client-key.pem \
+OPCUA_TRUSTED_CERTIFICATES=/pki/server.der \
+npm run test:secure
+```
+
+Set `OPCUA_USERNAME` and `OPCUA_PASSWORD` when the selected Endpoint uses a
+Username identity token. `OPCUA_CLIENT_APPLICATION_URI` must match the URI in
+the client certificate when it differs from the default.
 
 ## Stress test
 

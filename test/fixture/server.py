@@ -11,10 +11,20 @@ def main():
     point_count = int(sys.argv[2]) if len(sys.argv) > 2 else 20
     area_size = int(sys.argv[3]) if len(sys.argv) > 3 else 500
     operation_limit = int(sys.argv[4]) if len(sys.argv) > 4 else None
+    include_array = len(sys.argv) > 5 and sys.argv[5] == "array"
     server = Server()
     server.set_endpoint(f"opc.tcp://127.0.0.1:{port}")
     namespace = server.register_namespace("https://github.com/loliuy/opcua-client/test")
     folder = server.get_objects_node().add_folder(f"ns={namespace};s=Factory", "Factory")
+    array_node_id = None
+    if include_array:
+        array_node_id = f"ns={namespace};s=Factory.Array"
+        array_variable = folder.add_variable(
+            array_node_id,
+            "Array",
+            ua.Variant([0.0, 1.0, 2.0, 3.0, 4.0], ua.VariantType.Double),
+        )
+        array_variable.set_writable()
     areas = {}
     for index in range(point_count):
         area_index = index // area_size
@@ -37,10 +47,11 @@ def main():
             )
 
     server.start()
+    array_suffix = f" {array_node_id}" if array_node_id else ""
     print(
         f"RUNNING opc.tcp://127.0.0.1:{port} "
         f"ns={namespace};s=Factory.Area000.Point000000 "
-        f"ns={namespace};s=Factory {point_count}",
+        f"ns={namespace};s=Factory {point_count}{array_suffix}",
         flush=True,
     )
     try:

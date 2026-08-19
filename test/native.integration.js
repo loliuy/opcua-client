@@ -7,27 +7,43 @@ const { spawn } = require('node:child_process');
 const addon = require('../build/Release/opcua_open62541.node');
 
 async function fixture(port) {
-  const process = spawn('python3', [
-    path.join(__dirname, 'fixture', 'server.py'), String(port), '20', '500', '7',
-  ]);
+  const nativeServer = process.env.OPCUA_TEST_SERVER_BINARY;
+  const executable = nativeServer || 'python3';
+  const args = nativeServer
+    ? [String(port), '20', '500', '7']
+    : [path.join(__dirname, 'fixture', 'server.py'), String(port), '20', '500', '7'];
+  const childProcess = spawn(executable, args);
   let output = '';
   let errors = '';
-  process.stdout.on('data', (data) => { output += data; });
-  process.stderr.on('data', (data) => { errors += data; });
+  childProcess.stdout.on('data', (data) => { output += data; });
+  childProcess.stderr.on('data', (data) => { errors += data; });
   const deadline = Date.now() + 10000;
   while (!output.includes('RUNNING ') && Date.now() < deadline) {
-    if (process.exitCode != null) throw new Error(`Fixture exited: ${errors}`);
+    if (childProcess.exitCode != null) throw new Error(`Fixture exited: ${errors}`);
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  const match = output.match(/RUNNING (opc\.tcp:\/\/\S+) (ns=\S+)/);
+  const match = output.match(/RUNNING (opc\.tcp:\/\/\S+) (ns=\S+) \S+ \d+(?: (ns=\S+))?/);
   if (!match) throw new Error(`Fixture did not start: ${errors}`);
-  return { process, endpoint: match[1], nodeId: match[2] };
+  return {
+    process: childProcess,
+    endpoint: match[1],
+    nodeId: match[2],
+    arrayNodeId: match[3],
+  };
 }
 
 async function main() {
   const server = await fixture(4843);
   let clientId;
   try {
+    const endpoints = await addon.discoverEndpointsAsync({
+      endpoint: server.endpoint, requestTimeout: 2000,
+    });
+    assert(endpoints.some((endpoint) => (
+      endpoint.securityMode === 'None' &&
+      endpoint.securityPolicyUri.endsWith('#None') &&
+      endpoint.userIdentityTokens.some((token) => token.tokenType === 'Anonymous')
+    )));
     clientId = await addon.connectAsync({
       endpoint: server.endpoint, securityMode: 'None', nodeIdCacheSize: 32,
     });
@@ -40,6 +56,26 @@ async function main() {
     assert.equal(read[0].statusCode, 'Good');
     assert.equal(read[0].value, 0);
     await addon.readManyAsync(clientId, [{ nodeId: server.nodeId }]);
+
+    if (server.arrayNodeId) {
+      const partialRead = await addon.readManyAsync(clientId, [
+        { nodeId: server.arrayNodeId, indexRange: '1:3' },
+      ]);
+      assert.equal(partialRead[0].statusCode, 'Good');
+      assert.equal(partialRead[0].indexRange, '1:3');
+      assert.deepEqual(partialRead[0].value, [1, 2, 3]);
+
+      const partialWrite = await addon.writeManyAsync(clientId, [{
+        nodeId: server.arrayNodeId,
+        indexRange: '2:3',
+        value: [20, 30],
+        dataType: 'Double',
+      }]);
+      assert.equal(partialWrite[0].statusCode, 'Good');
+      assert.equal(partialWrite[0].indexRange, '2:3');
+      const arrayAfterWrite = await addon.readManyAsync(clientId, [{ nodeId: server.arrayNodeId }]);
+      assert.deepEqual(arrayAfterWrite[0].value, [0, 1, 20, 30, 4]);
+    }
 
     const changes = [];
     const notificationBatches = [];

@@ -40,6 +40,8 @@ test('Read and Write use one visible point list for manual and imported points',
     assert.match(html, /height: 180px/);
     assert.match(html, /margin: 0 !important/);
     assert.match(html, /Advanced settings/);
+    assert.match(html, /id="node-input-indexRange"/);
+    assert.match(html, /indexRange: \{ value: '' \}/);
   }
 });
 
@@ -80,4 +82,18 @@ test('Connection editor exposes a bounded native command queue', () => {
   const html = read('nodes/connection.html');
   assert.match(html, /id="node-config-input-commandQueueSize"/);
   assert.match(html, /commandQueueSize: \{ value: 256/);
+});
+
+test('Connection editor exposes strict secure endpoint discovery and trust settings', () => {
+  const html = read('nodes/connection.html');
+  assert.match(html, /id="node-config-input-discoverEndpoints"/);
+  assert.match(html, /id="node-config-input-testConnection"/);
+  assert.match(html, /Basic256Sha256/);
+  assert.match(html, /id="node-config-input-certificate"/);
+  assert.match(html, /id="node-config-input-privateKey"/);
+  assert.match(html, /id="node-config-input-privateKeyPassword"/);
+  assert.match(html, /id="node-config-input-applicationUri"/);
+  assert.match(html, /id="node-config-input-trustedCertificates"/);
+  assert.match(html, /id="node-config-input-revocationList"/);
+  assert.match(html, /No endpoint advertises/);
 });

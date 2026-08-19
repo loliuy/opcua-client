@@ -217,3 +217,32 @@ test('rebuilds all shards once when subscriptions become invalid', async () => {
 
   await harness.close();
 });
+
+test('waits for in-flight reconciliation before cleaning up on close', async () => {
+  const harness = createHarness(2);
+  const createSubscription = harness.client.createSubscription;
+  let releaseCreate;
+  let createStarted;
+  const createStartedPromise = new Promise((resolve) => {
+    createStarted = resolve;
+  });
+  const createGate = new Promise((resolve) => {
+    releaseCreate = resolve;
+  });
+  harness.client.createSubscription = async (...args) => {
+    createStarted();
+    await createGate;
+    return createSubscription(...args);
+  };
+
+  const input = harness.input({ payload: ['ns=2;s=A', 'ns=2;s=B'] });
+  await createStartedPromise;
+  const close = harness.close();
+  releaseCreate();
+
+  await Promise.all([input, close]);
+  assert.equal(harness.subscriptions.size, 0);
+  assert.equal(harness.node.subscriptions.size, 0);
+  assert.equal(harness.node.monitored.size, 0);
+  assert.equal(harness.node.desired.size, 0);
+});

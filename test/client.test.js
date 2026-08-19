@@ -2,25 +2,81 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { OpcUaClient, effectiveBatchSize, normalizeNotificationBatch } = require('../lib/client');
+const {
+  OpcUaClient,
+  discoverEndpoints,
+  effectiveBatchSize,
+  normalizeNotificationBatch,
+} = require('../lib/client');
 const { setAddonForTests, resetAddonForTests } = require('../lib/native');
 
 test.afterEach(() => resetAddonForTests());
+
+test('passes normalized secure connection options to the native addon', async () => {
+  let received;
+  setAddonForTests({
+    connectAsync: async (options) => {
+      received = options;
+      return 5;
+    },
+    disconnectAsync: async () => {},
+  });
+  const client = new OpcUaClient({
+    endpoint: 'opc.tcp://secure:4840',
+    securityMode: 'SignAndEncrypt',
+    securityPolicy: 'Basic256Sha256',
+    certificate: '/pki/client.der',
+    privateKey: '/pki/client-key.pem',
+    trustedCertificates: '/pki/server.der\n/pki/ca.der',
+  });
+  await client.connect();
+  assert.equal(received.securityPolicyUri,
+    'http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256');
+  assert.deepEqual(received.trustedCertificates, ['/pki/server.der', '/pki/ca.der']);
+  await client.disconnect();
+});
+
+test('discovers endpoint security and identity metadata through the native addon', async () => {
+  const expected = [{
+    endpointUrl: 'opc.tcp://server:4840',
+    securityMode: 'SignAndEncrypt',
+    securityPolicyUri: 'http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256',
+    userIdentityTokens: [{ tokenType: 'Username' }],
+  }];
+  let received;
+  setAddonForTests({
+    discoverEndpointsAsync: async (options) => {
+      received = options;
+      return expected;
+    },
+  });
+  const endpoints = await discoverEndpoints({
+    endpoint: ' opc.tcp://server:4840 ', requestTimeout: 2500,
+  });
+  assert.deepEqual(received, {
+    endpoint: 'opc.tcp://server:4840', requestTimeout: 2500,
+  });
+  assert.deepEqual(endpoints, expected);
+});
 
 test('uses batch native services and preserves request order', async () => {
   const calls = [];
   setAddonForTests({
     connectAsync: async () => 7,
     readManyAsync: async (_client, items) => {
-      calls.push(items.map((item) => item.nodeId));
+      calls.push(items.map((item) => ({ ...item })));
       return items.map((item) => ({ nodeId: item.nodeId, value: item.nodeId, statusCode: 'Good' }));
     },
     disconnectAsync: async () => {},
   });
   const client = new OpcUaClient({ endpoint: 'opc.tcp://test:4840' });
-  const points = Array.from({ length: 5 }, (_, index) => ({ nodeId: `ns=2;i=${index}` }));
+  const points = Array.from({ length: 5 }, (_, index) => ({
+    nodeId: `ns=2;i=${index}`,
+    ...(index === 0 ? { indexRange: '1:3' } : {}),
+  }));
   const values = await client.readMany(points, 2);
   assert.deepEqual(calls.map((batch) => batch.length), [2, 2, 1]);
+  assert.equal(calls[0][0].indexRange, '1:3');
   assert.deepEqual(values.map((item) => item.nodeId), points.map((item) => item.nodeId));
   await client.disconnect();
 });
@@ -191,4 +247,113 @@ test('replaces a terminal native client and reconnects with bounded backoff', as
   assert.equal(supervisor.reconnectSuccesses, 1);
   await client.disconnect();
   assert.equal(disconnects, 2);
+});
+
+test('does not open a second native client while a terminal client is closing', async () => {
+  const callbacks = [];
+  const disconnects = [];
+  let connectCalls = 0;
+  let releaseTerminalDisconnect;
+  let terminalDisconnectStarted;
+  const terminalDisconnectStartedPromise = new Promise((resolve) => {
+    terminalDisconnectStarted = resolve;
+  });
+  const terminalDisconnectGate = new Promise((resolve) => {
+    releaseTerminalDisconnect = resolve;
+  });
+
+  setAddonForTests({
+    connectAsync: async (_options, callback) => {
+      callbacks.push(callback);
+      connectCalls += 1;
+      return 50 + connectCalls;
+    },
+    readManyAsync: async (handle, items) => items.map((item) => ({ ...item, handle })),
+    getClientDiagnostics: () => ({
+      connection: { state: 'connected', connected: true, sessionGeneration: 1 },
+      operationLimits: {},
+      nodeIdCache: {},
+    }),
+    disconnectAsync: async (handle) => {
+      disconnects.push(handle);
+      if (handle === 51) {
+        terminalDisconnectStarted();
+        await terminalDisconnectGate;
+      }
+    },
+  });
+
+  const client = new OpcUaClient({
+    endpoint: 'opc.tcp://test:4840', reconnectInterval: 100, maxReconnectInterval: 100,
+  });
+  await client.connect();
+  callbacks[0]({
+    state: 'failed', connected: false, recoverable: false,
+    terminal: true, statusCode: 'BadConnectionRejected',
+  });
+  await terminalDisconnectStartedPromise;
+
+  await assert.rejects(
+    () => client.readMany([{ nodeId: 'ns=2;i=1' }]),
+    (error) => error.code === 'OPCUA_RECONNECTING'
+  );
+  assert.equal(connectCalls, 1);
+
+  releaseTerminalDisconnect();
+  const deadline = Date.now() + 1000;
+  while (connectCalls < 2 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(connectCalls, 2);
+  const values = await client.readMany([{ nodeId: 'ns=2;i=1' }]);
+  assert.equal(values[0].handle, 52);
+
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(client.getState().state, 'connected');
+  assert.equal(connectCalls, 2);
+  await client.disconnect();
+  assert.deepEqual(disconnects, [51, 52]);
+});
+
+test('disconnect waits for terminal replacement and does not close a handle twice', async () => {
+  let stateCallback;
+  let releaseTerminalDisconnect;
+  let terminalDisconnectStarted;
+  const disconnects = [];
+  const terminalDisconnectStartedPromise = new Promise((resolve) => {
+    terminalDisconnectStarted = resolve;
+  });
+  const terminalDisconnectGate = new Promise((resolve) => {
+    releaseTerminalDisconnect = resolve;
+  });
+
+  setAddonForTests({
+    connectAsync: async (_options, callback) => {
+      stateCallback = callback;
+      return 61;
+    },
+    disconnectAsync: async (handle) => {
+      disconnects.push(handle);
+      terminalDisconnectStarted();
+      await terminalDisconnectGate;
+    },
+  });
+
+  const client = new OpcUaClient({
+    endpoint: 'opc.tcp://test:4840', reconnectInterval: 100, maxReconnectInterval: 100,
+  });
+  await client.connect();
+  stateCallback({
+    state: 'failed', connected: false, recoverable: false,
+    terminal: true, statusCode: 'BadConnectionRejected',
+  });
+  await terminalDisconnectStartedPromise;
+
+  const closing = client.disconnect();
+  releaseTerminalDisconnect();
+  await closing;
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  assert.deepEqual(disconnects, [61]);
+  assert.equal(client.getState().state, 'closed');
 });

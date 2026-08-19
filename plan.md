@@ -18,7 +18,7 @@ OPC UA Server 节点不在本仓库范围内，继续使用独立容器。
 - 已实现 Subscription 容量分片、跨分片增删恢复、50ms/500 条双阈值聚合和稳定 clientHandle 索引。
 - 已实现专属 C++ `UA_Client` 所有者线程、有界命令队列、排队超时和关闭清理。
 - 已完成 20,000 点采集/写入内存拆分，并将 Node-RED 内部 CSV 混合压测峰值由复测的 362.29 MB 稳定降至 226.06-226.73 MB。
-- 当前缺口：安全连接、离线交付、P1/P2 扩展，以及线程模型的 ThreadSanitizer/长稳验收。
+- 当前缺口：安全端点现场验收、离线交付、其余 P1/P2 扩展，以及线程模型的 ThreadSanitizer/长稳验收。
 
 ## P0：批量订阅模型闭环
 
@@ -84,11 +84,13 @@ OPC UA Server 节点不在本仓库范围内，继续使用独立容器。
 
 ### P0.5 安全连接
 
-- [ ] open62541 开启加密后端。
-- [ ] 支持 None、Sign、SignAndEncrypt 和配置的 SecurityPolicy。
-- [ ] certificate、privateKey、用户名和密码使用 Node-RED credentials 存储。
-- [ ] 增加证书信任、拒绝列表和错误提示。
-- [ ] 增加安全端点真实连接测试。
+- [x] open62541 开启 OpenSSL 加密后端。
+- [x] 支持 None、Sign、SignAndEncrypt 和 Basic256Sha256。
+- [x] 密码和私钥密码使用 Node-RED credentials；证书、私钥、信任列表和 CRL 使用运行时可见路径。
+- [x] 增加严格证书信任、CRL 和可操作错误提示。
+- [x] 增加 Endpoint Discovery、连接测试和真实安全端点集成测试入口。
+
+2026-08-19 阶段验证：安全配置、端点匹配、凭据传递和重连竞态单元测试通过；真实安全端点测试脚本已加入。使用本地 open62541 `v1.4.16` tag 和 Node-RED 22 Docker 镜像内头文件，OpenSSL open62541 静态库及 N-API 插件已编译通过；仍需用现场证书执行 `npm run test:secure`。
 
 ### P0.6 npm 与 Enterprise 离线交付
 
@@ -103,9 +105,11 @@ OPC UA Server 节点不在本仓库范围内，继续使用独立容器。
 
 - [ ] OPC UA RegisterNodes/UnregisterNodes 服务，并与 NodeId cache 明确区分。
 - [ ] 通用 Info/Attributes 节点。
-- [ ] Read/Write IndexRange。
-- [ ] Write 数组和矩阵类型。
-- [ ] Endpoint Discovery 和端点选择。
+- [x] Read/Write IndexRange。
+- [x] Write 数组和矩阵类型。
+- [x] Endpoint Discovery 和端点选择。
+
+2026-08-19 阶段验证：IndexRange 语法校验、旧 `range`/`msg.interval` 兼容、数组与矩阵输入、批量透传和编辑器测试通过；Node 22 Docker 中使用 open62541 `v1.4.16` 完成原生编译，37 项单元测试通过。新增 open62541 C 集成测试 Server 后，`IndexRange=1:3` 范围读取返回 `[1,2,3]`，`IndexRange=2:3` 局部写入后完整数组为 `[0,1,20,30,4]`，真实范围读写验收通过。Python OPC UA fixture 会忽略 IndexRange，因此只保留用于其余原生集成场景。
 
 ## P2：扩展能力
 

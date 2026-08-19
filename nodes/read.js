@@ -12,7 +12,9 @@ module.exports = function registerReadNode(RED) {
       if (!node.connection) return done(new Error('OPC UA connection not configured'));
 
       try {
-        const points = messagePoints(msg, config.nodeId, {}, {
+        const points = messagePoints(msg, config.nodeId, {
+          indexRange: config.indexRange,
+        }, {
           configuredPayload: config.pointList,
           format: 'auto',
         });

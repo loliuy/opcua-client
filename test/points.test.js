@@ -8,6 +8,7 @@ const {
   looksLikePointList,
   messagePoints,
   messageWritePoints,
+  normalizeIndexRange,
   normalizePoints,
   parseCsv,
   parsePointPayload,
@@ -23,6 +24,17 @@ test('normalizes and deduplicates point descriptors', () => {
   assert.equal(result.points.length, 2);
   assert.equal(result.points[1].alias, 'new');
   assert.equal(result.points[1].samplingInterval, 250);
+  assert.equal(normalizePoints([{
+    nodeId: 'ns=2;s=C', deadbandType: 'p', deadbandValue: '2.5',
+    discardOldest: 'false',
+  }]).points[0].deadbandType, 'percent');
+  assert.equal(normalizePoints([{
+    nodeId: 'ns=2;s=C', deadbandType: 'p', deadbandValue: '2.5',
+    discardOldest: 'false',
+  }]).points[0].discardOldest, false);
+  assert.equal(normalizePoints([
+    { nodeId: 'ns=2;s=DisabledByCsv', enabled: 'false' },
+  ]).points.length, 0);
 });
 
 test('parses quoted CSV point lists', () => {
@@ -52,6 +64,21 @@ test('supports scalar and batch Node-RED messages', () => {
   assert.equal(messagePoints({ payload: 1 }, '', {}, {
     configuredPayload: 'nodeId\nns=2;s=Imported',
   })[0].nodeId, 'ns=2;s=Imported');
+  assert.deepEqual(
+    messagePoints({ topic: 'ns=2;s=Array', interval: 250, queueSize: 3, range: '1:4' })[0],
+    {
+      nodeId: 'ns=2;s=Array', samplingInterval: 250, queueSize: 3,
+      discardOldest: true, indexRange: '1:4', enabled: true,
+    }
+  );
+});
+
+test('normalizes OPC UA index ranges and rejects malformed ranges', () => {
+  assert.equal(normalizeIndexRange(' 0:9, 2:3 '), '0:9,2:3');
+  assert.equal(normalizeIndexRange('4'), '4');
+  assert.throws(() => normalizeIndexRange('9:2'), /Invalid OPC UA IndexRange/);
+  assert.throws(() => normalizeIndexRange('-1'), /Invalid OPC UA IndexRange/);
+  assert.throws(() => normalizeIndexRange('1:'), /Invalid OPC UA IndexRange/);
 });
 
 test('parses and coerces JSON and CSV write imports', () => {
@@ -100,6 +127,24 @@ test('streams CSV writes into compact deduplicated points', () => {
     payload: [{ nodeId: 'ns=2;s=C', value: 3, dataType: 'Int32' }],
   }, { inputFormat: 'csv' });
   assert.equal(arrayInput[0].value, 3);
+});
+
+test('preserves index ranges and array values for partial writes', () => {
+  const csv = messageWritePoints({
+    payload: 'nodeId,value,dataType,indexRange\nns=2;s=A,7,Double,2',
+  });
+  assert.equal(csv[0].indexRange, '2');
+
+  const direct = messageWritePoints({
+    topic: 'ns=2;s=Array', payload: [1, 2, 3], indexRange: '4:6', dataType: 'Double',
+  });
+  assert.deepEqual(direct[0].value, [1, 2, 3]);
+  assert.equal(direct[0].indexRange, '4:6');
+
+  const configured = messageWritePoints({ payload: [[1, 2], [3, 4]] }, {
+    pointList: '[{"nodeId":"ns=2;s=Matrix","dataType":"Int32","useInput":true}]',
+  });
+  assert.deepEqual(configured[0].value, [[1, 2], [3, 4]]);
 });
 
 test('chunks large requests without losing order', () => {
