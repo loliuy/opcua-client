@@ -4,6 +4,11 @@
   .opcua-standard-note { margin: 0 0 10px 105px; color: var(--red-ui-form-text-color, #666); font-size: 0.9em; }
   .opcua-discovery-result { margin: 6px 0 8px 105px; max-width: 70%; }
   .opcua-discovery-result select { width: 100%; }
+  .opcua-security-path { width: calc(70% - 88px) !important; }
+  .opcua-security-list { display: inline-block; width: 70%; vertical-align: top; }
+  .opcua-security-list textarea { width: 100%; box-sizing: border-box; }
+  .opcua-security-upload { margin-top: 4px; }
+  .opcua-hidden-file { display: none !important; }
 </style>
 <script type="text/html" data-template-name="tier0-opcua-connection">
   <div class="form-row"><label for="node-config-input-endpoint">Endpoint</label><input type="text" id="node-config-input-endpoint" placeholder="opc.tcp://127.0.0.1:4840"></div>
@@ -17,12 +22,13 @@
     <div class="form-row"><label for="node-config-input-securityPolicy">Policy</label><select id="node-config-input-securityPolicy"><option value="None">None</option><option value="Basic256Sha256">Basic256Sha256</option></select></div>
     <div class="form-row"><label for="node-config-input-user">User</label><input type="text" id="node-config-input-user"></div>
     <div class="form-row"><label for="node-config-input-password">Password</label><input type="password" id="node-config-input-password"></div>
-    <div class="form-row opcua-secure-field"><label for="node-config-input-certificate">Client certificate</label><input type="text" id="node-config-input-certificate" placeholder="/path/to/client.der"></div>
-    <div class="form-row opcua-secure-field"><label for="node-config-input-privateKey">Client private key</label><input type="text" id="node-config-input-privateKey" placeholder="/path/to/client-key.pem"></div>
+    <div class="form-row opcua-secure-field"><label for="node-config-input-certificate">Client certificate</label><input type="text" class="opcua-security-path" id="node-config-input-certificate" placeholder="Upload or enter /path/to/client.der"> <button type="button" class="red-ui-button" id="node-config-upload-certificate"><i class="fa fa-upload"></i> Upload</button><input type="file" class="opcua-hidden-file" id="node-config-file-certificate" accept=".der,.pem,.crt,.cer"></div>
+    <div class="form-row opcua-secure-field"><label for="node-config-input-privateKey">Client private key</label><input type="text" class="opcua-security-path" id="node-config-input-privateKey" placeholder="Upload or enter /path/to/client-key.pem"> <button type="button" class="red-ui-button" id="node-config-upload-privateKey"><i class="fa fa-upload"></i> Upload</button><input type="file" class="opcua-hidden-file" id="node-config-file-privateKey" accept=".der,.pem,.key"></div>
     <div class="form-row opcua-secure-field"><label for="node-config-input-privateKeyPassword">Key password</label><input type="password" id="node-config-input-privateKeyPassword"></div>
     <div class="form-row opcua-secure-field"><label for="node-config-input-applicationUri">Application URI</label><input type="text" id="node-config-input-applicationUri" placeholder="Must match the client certificate"></div>
-    <div class="form-row opcua-secure-field"><label for="node-config-input-trustedCertificates">Trusted certificates</label><textarea id="node-config-input-trustedCertificates" rows="3" placeholder="One Server or CA certificate path per line"></textarea></div>
-    <div class="form-row opcua-secure-field"><label for="node-config-input-revocationList">Revocation list</label><textarea id="node-config-input-revocationList" rows="2" placeholder="Optional CRL path, one per line"></textarea></div>
+    <div class="form-row opcua-secure-field"><label for="node-config-input-trustedCertificates">Trusted certificates</label><div class="opcua-security-list"><textarea id="node-config-input-trustedCertificates" rows="3" placeholder="Upload files or enter one Server/CA path per line"></textarea><button type="button" class="red-ui-button opcua-security-upload" id="node-config-upload-trustedCertificates"><i class="fa fa-upload"></i> Upload files</button><input type="file" multiple class="opcua-hidden-file" id="node-config-file-trustedCertificates" accept=".der,.pem,.crt,.cer"></div></div>
+    <div class="form-row opcua-secure-field"><label for="node-config-input-revocationList">Revocation list</label><div class="opcua-security-list"><textarea id="node-config-input-revocationList" rows="2" placeholder="Upload files or enter one optional CRL path per line"></textarea><button type="button" class="red-ui-button opcua-security-upload" id="node-config-upload-revocationList"><i class="fa fa-upload"></i> Upload files</button><input type="file" multiple class="opcua-hidden-file" id="node-config-file-revocationList" accept=".der,.pem,.crl"></div></div>
+    <div class="opcua-standard-note opcua-secure-field">Uploaded files are stored under the Node-RED user directory. Runtime-visible paths may still be entered directly.</div>
     <div class="form-row"><label for="node-config-input-requestedSessionTimeout">Session timeout</label><input type="number" id="node-config-input-requestedSessionTimeout"></div>
     <div class="form-row"><label for="node-config-input-requestTimeout">Request timeout</label><input type="number" id="node-config-input-requestTimeout"></div>
     <div class="form-row"><label for="node-config-input-connectivityCheckInterval">Connectivity check</label><input type="number" id="node-config-input-connectivityCheckInterval"></div>
@@ -30,8 +36,41 @@
     <div class="form-row"><label for="node-config-input-maxReconnectInterval">Max reconnect</label><input type="number" id="node-config-input-maxReconnectInterval"></div>
     <div class="form-row"><label for="node-config-input-nodeIdCacheSize">NodeId cache</label><input type="number" id="node-config-input-nodeIdCacheSize"></div>
     <div class="form-row"><label for="node-config-input-commandQueueSize">Command queue</label><input type="number" id="node-config-input-commandQueueSize"></div>
+    <div class="form-row"><label for="node-config-input-allowParallelSession">Parallel Session</label><input type="checkbox" id="node-config-input-allowParallelSession" style="width:auto"></div>
+    <div class="opcua-standard-note">Leave disabled and reuse one Connection configuration for one Session. Enable only when a separate Session with equivalent settings is intentional.</div>
   </details>
   <div class="form-row"><label for="node-config-input-name">Name</label><input type="text" id="node-config-input-name"></div>
+</script>
+<script type="text/html" data-help-name="tier0-opcua-connection">
+  <section lang="zh-CN">
+    <h3>连接（Connection）</h3>
+    <p>创建并维护共享的 OPC UA SecureChannel 和 Session，供 Browse、Read、Write、Subscribe 节点复用。配置节点本身没有消息输入或输出。</p>
+    <h4>主要配置</h4>
+    <ul>
+      <li><b>Endpoint</b>：服务器地址，例如 <code>opc.tcp://192.168.1.10:4840</code>。</li>
+      <li><b>Discover endpoints</b>：读取服务器公开的安全模式、安全策略和用户认证方式。</li>
+      <li><b>Test connection</b>：使用当前配置建立临时连接并验证认证。</li>
+      <li><b>Security</b>：支持 None、Sign、SignAndEncrypt；安全模式、策略和认证方式必须与服务器 Endpoint 匹配。</li>
+      <li><b>证书</b>：安全连接可上传或指定客户端证书、私钥、信任证书和 CRL。Application URI 应与客户端证书一致。</li>
+    </ul>
+    <h4>建议</h4>
+    <p>一个 Connection 配置对应一条客户端 Session。多个业务节点应复用同一个 Connection，避免为相同 Endpoint 重复创建 Session。节点内置自动重连、连通性检查以及有界命令队列。</p>
+  </section>
+  <hr>
+  <section lang="en">
+    <h3>Connection</h3>
+    <p>Creates and maintains a shared OPC UA SecureChannel and Session for Browse, Read, Write, and Subscribe nodes. The configuration node itself has no message input or output.</p>
+    <h4>Main settings</h4>
+    <ul>
+      <li><b>Endpoint</b>: Server URL, for example <code>opc.tcp://192.168.1.10:4840</code>.</li>
+      <li><b>Discover endpoints</b>: Reads advertised security modes, policies, and user token types.</li>
+      <li><b>Test connection</b>: Opens a temporary connection with the current settings and validates authentication.</li>
+      <li><b>Security</b>: Supports None, Sign, and SignAndEncrypt. Mode, policy, and identity must match an advertised endpoint.</li>
+      <li><b>Certificates</b>: Secure connections can upload or reference a client certificate, private key, trust list, and CRLs. The Application URI should match the client certificate.</li>
+    </ul>
+    <h4>Recommendation</h4>
+    <p>One Connection configuration owns one client Session. Reuse it across nodes targeting the same server instead of creating duplicate Sessions. Automatic reconnect, connectivity checks, and a bounded command queue are enabled.</p>
+  </section>
 </script>
 <script type="text/javascript">
   RED.nodes.registerType('tier0-opcua-connection', {
@@ -48,6 +87,7 @@
       maxReconnectInterval: { value: 30000, validate: RED.validators.number() },
       nodeIdCacheSize: { value: 100000, validate: RED.validators.number() },
       commandQueueSize: { value: 256, validate: RED.validators.number() },
+      allowParallelSession: { value: false },
       name: { value: '' }
     },
     credentials: {
@@ -72,6 +112,94 @@
       };
       mode.on('change', updateSecurityFields);
       updateSecurityFields();
+
+      const maxSecurityFileSize = 2 * 1024 * 1024;
+      const uploadSecurityFile = function (file, kind) {
+        return new Promise(function (resolve, reject) {
+          if (!connectionId) {
+            reject(new Error('Save the Connection node once before uploading security files'));
+            return;
+          }
+          if (file.size > maxSecurityFileSize) {
+            reject(new Error(`${file.name} exceeds the 2 MiB security file limit`));
+            return;
+          }
+          const reader = new FileReader();
+          reader.onerror = function () {
+            reject(new Error(`Cannot read ${file.name}`));
+          };
+          reader.onload = function () {
+            const encoded = String(reader.result || '');
+            const separator = encoded.indexOf(',');
+            if (separator < 0) {
+              reject(new Error(`Cannot encode ${file.name}`));
+              return;
+            }
+            $.ajax({
+              url: 'opcua-client/security-files',
+              method: 'POST',
+              contentType: 'application/json',
+              data: JSON.stringify({
+                connectionId,
+                kind,
+                fileName: file.name,
+                contentBase64: encoded.slice(separator + 1)
+              })
+            }).done(function (response) {
+              resolve(response.file);
+            }).fail(function (xhr) {
+              reject(new Error(xhr.responseJSON?.error || `Cannot upload ${file.name}`));
+            });
+          };
+          reader.readAsDataURL(file);
+        });
+      };
+
+      const bindSecurityUpload = function (buttonSelector, fileSelector, targetSelector, kind, append) {
+        const button = $(buttonSelector);
+        const fileInput = $(fileSelector);
+        const target = $(targetSelector);
+        button.on('click', function () { fileInput.trigger('click'); });
+        fileInput.on('change', function () {
+          const input = this;
+          const files = Array.from(input.files || []);
+          if (!files.length) return;
+          button.prop('disabled', true);
+          files.reduce(function (chain, file) {
+            return chain.then(function () {
+              return uploadSecurityFile(file, kind);
+            }).then(function (uploaded) {
+              if (!append) {
+                target.val(uploaded.path);
+                return;
+              }
+              const paths = String(target.val() || '').split(/\r?\n|;/)
+                .map(function (entry) { return entry.trim(); })
+                .filter(Boolean);
+              if (paths.indexOf(uploaded.path) < 0) paths.push(uploaded.path);
+              target.val(paths.join('\n'));
+            });
+          }, Promise.resolve()).then(function () {
+            RED.notify(`${files.length} OPC UA security file(s) uploaded`, 'success');
+          }).catch(function (error) {
+            RED.notify(error.message || String(error), 'error');
+          }).then(function () {
+            input.value = '';
+            button.prop('disabled', false);
+          });
+        });
+      };
+
+      bindSecurityUpload('#node-config-upload-certificate', '#node-config-file-certificate',
+        '#node-config-input-certificate', 'clientCertificate', false);
+      bindSecurityUpload('#node-config-upload-privateKey', '#node-config-file-privateKey',
+        '#node-config-input-privateKey', 'privateKey', false);
+      bindSecurityUpload('#node-config-upload-trustedCertificates',
+        '#node-config-file-trustedCertificates', '#node-config-input-trustedCertificates',
+        'trustedCertificate', true);
+      bindSecurityUpload('#node-config-upload-revocationList',
+        '#node-config-file-revocationList', '#node-config-input-revocationList',
+        'revocationList', true);
 
       const connectionSettings = function () {
         return {

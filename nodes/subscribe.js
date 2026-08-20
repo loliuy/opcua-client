@@ -12,6 +12,44 @@ const NOTIFICATION_CONFIG_FIELDS = new Set([
   'enabled',
 ]);
 
+const COMPACT_NOTIFICATION_FIELDS = Object.freeze([
+  'nodeId',
+  'value',
+  'statusCode',
+  'sourceTimestamp',
+]);
+
+function valueOnly(change) {
+  return Object.prototype.hasOwnProperty.call(change, 'value') ? change.value : null;
+}
+
+function compactChange(change, point) {
+  const output = {};
+  for (const field of COMPACT_NOTIFICATION_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(change, field)) output[field] = change[field];
+  }
+  if (point.alias != null && point.alias !== '') output.alias = point.alias;
+  return output;
+}
+
+function valueChange(change, point) {
+  return {
+    nodeId: change.nodeId,
+    ...(point.alias != null && point.alias !== '' ? { alias: point.alias } : {}),
+    ...(Object.prototype.hasOwnProperty.call(change, 'value') ? { value: change.value } : {}),
+  };
+}
+
+function fullChange(change, point, subscriptionId) {
+  change.subscriptionId = subscriptionId;
+  for (const key in point) {
+    if (!NOTIFICATION_CONFIG_FIELDS.has(key) && !Object.hasOwn(change, key)) {
+      change[key] = point[key];
+    }
+  }
+  return change;
+}
+
 function positiveInteger(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
@@ -40,6 +78,11 @@ module.exports = function registerSubscribeNode(RED) {
     const callbackBatchSize = positiveInteger(config.callbackBatchSize, 500);
     const callbackFlushIntervalMs = positiveInteger(config.callbackFlushIntervalMs, 50);
     const configuredSubscriptionCapacity = positiveInteger(config.maxItemsPerSubscription, 5000);
+    // Undefined preserves the descriptor-rich output used by Flow JSON created
+    // before resultDetail existed. New editor nodes explicitly save compact.
+    const resultDetail = ['compact', 'value', 'full'].includes(config.resultDetail)
+      ? config.resultDetail
+      : 'full';
 
     function subscriptionIds() {
       return [...node.subscriptions.keys()];
@@ -108,14 +151,23 @@ module.exports = function registerSubscribeNode(RED) {
       if (!changes.length || node.closing) return;
       const diagnostics = combinedDiagnostics();
       updateQueueWarning(diagnostics);
-      node.send({
-        payload: changes,
+      const output = {
+        payload: resultDetail === 'value' ? changes.map(valueOnly) : changes,
         opcua: {
           operation: 'change',
           total: changes.length,
           subscriptionCount: node.subscriptions.size,
+          resultDetail,
           queue: diagnostics,
         },
+      };
+      if (resultDetail === 'value') {
+        // Subscription batches are sparse and may repeat one NodeId. A parallel
+        // identifier array preserves every change without repeating objects.
+        output.opcua.identifiers = changes.map((change) => change.alias || change.nodeId);
+      }
+      node.send({
+        ...output,
       });
     }
 
@@ -158,23 +210,26 @@ module.exports = function registerSubscribeNode(RED) {
         const change = sourceChanges[index];
         const point = node.desired.get(change.nodeId);
         if (!point) continue;
-        change.subscriptionId = record.id;
-        for (const key in point) {
-          if (!NOTIFICATION_CONFIG_FIELDS.has(key) && !Object.hasOwn(change, key)) {
-            change[key] = point[key];
-          }
-        }
-        changes.push(change);
+        changes.push(resultDetail === 'compact'
+          ? compactChange(change, point)
+          : resultDetail === 'value'
+            ? valueChange(change, point)
+            : fullChange(change, point, record.id));
       }
 
       if ((config.outputMode || 'batch') === 'single') {
         const queue = combinedDiagnostics();
         updateQueueWarning(queue);
-        changes.forEach((change, index) => node.send({
-          topic: change.nodeId,
-          payload: change.value,
-          opcua: index === 0 ? { ...change, queue } : change,
-        }));
+        changes.forEach((change, index) => {
+          const output = {
+            topic: change.nodeId,
+            payload: valueOnly(change),
+          };
+          if (resultDetail === 'value') {
+            if (index === 0) output.opcua = { operation: 'change', resultDetail, queue };
+          } else output.opcua = index === 0 ? { ...change, queue } : change;
+          node.send(output);
+        });
       } else if (changes.length) {
         node.pendingChanges.push(...changes);
         flushFullBatches();
@@ -358,6 +413,7 @@ module.exports = function registerSubscribeNode(RED) {
         subscriptionCount: ids.length,
         subscriptionId: ids[0] ?? null,
         subscriptionIds: ids,
+        connectionGovernance: node.connection?.getConnectionGovernance?.(),
       };
     }
 

@@ -7,7 +7,7 @@
   <div class="form-row"><label for="node-input-connection">Connection</label><input type="text" id="node-input-connection"></div>
   <div class="form-row"><label for="node-input-nodeId">NodeId</label><input type="text" id="node-input-nodeId" placeholder="Optional when input supplies points"></div>
   <div class="form-row"><label for="node-input-samplingInterval">Sampling (ms)</label><input type="number" id="node-input-samplingInterval"></div>
-  <div class="opcua-standard-note">Standard mode shards large point sets across subscriptions, batches changes, and automatically restores them after reconnect.</div>
+  <div class="opcua-standard-note">Standard mode keeps the latest pending value per point, shards large point sets, batches changes, and automatically restores them after reconnect.</div>
   <details class="opcua-advanced">
     <summary>Advanced subscription and queue settings</summary>
     <div class="form-row"><label for="node-input-publishingInterval">Publishing interval</label><input type="number" id="node-input-publishingInterval"></div>
@@ -19,6 +19,7 @@
     <div class="form-row"><label for="node-input-batchSize">Create batch size</label><input type="number" id="node-input-batchSize"></div>
     <div class="form-row"><label for="node-input-maxItemsPerSubscription">Items / subscription</label><input type="number" id="node-input-maxItemsPerSubscription"></div>
     <div class="form-row"><label for="node-input-outputMode">Change output</label><select id="node-input-outputMode"><option value="batch">Native batch</option><option value="single">One message per change</option></select></div>
+    <div class="form-row"><label for="node-input-resultDetail">Result detail</label><select id="node-input-resultDetail"><option value="compact">Compact</option><option value="value">Value only</option><option value="full">Full metadata</option></select></div>
     <div class="form-row"><label for="node-input-callbackBatchSize">Output batch size</label><input type="number" id="node-input-callbackBatchSize"></div>
     <div class="form-row"><label for="node-input-callbackFlushIntervalMs">Batch flush (ms)</label><input type="number" id="node-input-callbackFlushIntervalMs"></div>
     <div class="form-row"><label for="node-input-callbackQueueSize">Native queue capacity</label><input type="number" id="node-input-callbackQueueSize"></div>
@@ -27,21 +28,66 @@
   </details>
   <div class="form-row"><label for="node-input-name">Name</label><input type="text" id="node-input-name"></div>
 </script>
-<script type="text/html" data-help-name="tier0-opcua-subscribe"><p>Creates one or more OPC UA subscriptions for many monitored items. Input may be an array, JSON, CSV, or Browse output. Commands are <code>replace</code>, <code>add</code>, <code>remove</code>, and <code>clear</code> in <code>msg.opcua.command</code>.</p><p>The node automatically honors the server subscription limit when available. Batch output flushes when its size threshold is reached or its time window expires. Queue diagnostics are reported in <code>msg.opcua.queue</code>.</p></script>
+<script type="text/html" data-help-name="tier0-opcua-subscribe">
+  <section lang="zh-CN">
+    <h3>订阅（Subscribe）</h3>
+    <p>创建 OPC UA Subscription 和 MonitoredItems，由服务器在值变化时推送通知；它不是客户端定时 Read。大量点位会按照服务器限制自动拆分到多个 Subscription。</p>
+    <h4>输入与命令</h4>
+    <p>点表可来自数组、JSON、CSV 或 Browse 输出。通过 <code>msg.opcua.command</code> 使用 <code>replace</code>、<code>add</code>、<code>remove</code>、<code>clear</code> 动态管理点位。</p>
+    <h4>时间与队列</h4>
+    <ul>
+      <li><b>Sampling</b>：服务器检查 MonitoredItem 的请求间隔。</li>
+      <li><b>Publishing interval</b>：服务器发布已排队通知的请求周期。</li>
+      <li><b>Batch flush</b>：Node-RED 合并通知的最大等待时间，不影响服务器采样。</li>
+      <li>服务器可以把请求间隔修订为它支持的值。</li>
+    </ul>
+    <p>新节点默认 Server queue size=1、Discard oldest=true、Queue mode=latest，适合实时状态采集。脉冲、报警转换或完整历史不能丢失时，应改为 all 并增大服务器队列。</p>
+    <h4>输出</h4>
+    <ul>
+      <li><b>Compact</b>：NodeId/alias、值、状态和源时间戳。</li>
+      <li><b>Value only</b>：值在 <code>msg.payload</code>，同位置标识在 <code>msg.opcua.identifiers</code>。</li>
+      <li><b>Full metadata</b>：保留完整诊断字段。</li>
+    </ul>
+    <p>队列深度、丢弃数和延迟位于 <code>msg.opcua.queue</code>；发生溢出时节点会显示警告。</p>
+  </section>
+  <hr>
+  <section lang="en">
+    <h3>Subscribe</h3>
+    <p>Creates one or more OPC UA subscriptions and MonitoredItems so the server sends data-change notifications. It is not a periodic client Read. Large point sets are automatically sharded across Subscriptions according to server limits.</p>
+    <h4>Input and commands</h4>
+    <p>Point lists may come from arrays, JSON, CSV, or Browse output. Use <code>replace</code>, <code>add</code>, <code>remove</code>, or <code>clear</code> in <code>msg.opcua.command</code> to manage points dynamically.</p>
+    <h4>Timing and queues</h4>
+    <ul>
+      <li><b>Sampling</b>: Requested interval at which the server checks a MonitoredItem.</li>
+      <li><b>Publishing interval</b>: Requested cycle at which the server publishes queued notifications.</li>
+      <li><b>Batch flush</b>: Maximum Node-RED aggregation delay; it does not control server sampling.</li>
+      <li>The server may revise requested intervals to supported values.</li>
+    </ul>
+    <p>New nodes default to server queue size 1, discard-oldest, and local latest coalescing for real-time state. Select all and increase the server queue for pulses, alarm transitions, or history where every change must be retained.</p>
+    <h4>Output</h4>
+    <ul>
+      <li><b>Compact</b>: NodeId/alias, value, status, and source timestamp.</li>
+      <li><b>Value only</b>: Values are in <code>msg.payload</code>; matching identities are in <code>msg.opcua.identifiers</code>.</li>
+      <li><b>Full metadata</b>: Preserves full diagnostic fields.</li>
+    </ul>
+    <p>Queue depth, drops, and lag are reported in <code>msg.opcua.queue</code>. Queue overflow also raises a node warning.</p>
+  </section>
+</script>
 <script type="text/javascript">
   RED.nodes.registerType('tier0-opcua-subscribe', {
     category: 'OPC UA', color: '#c7e9f1', inputs: 1, outputs: 1, icon: 'bridge.png',
     defaults: {
       connection: { value: '', type: 'tier0-opcua-connection', required: true }, nodeId: { value: '' },
       publishingInterval: { value: 1000, validate: RED.validators.number() }, samplingInterval: { value: 1000, validate: RED.validators.number() },
-      queueSize: { value: 10, validate: RED.validators.number() }, discardOldest: { value: true },
+      queueSize: { value: 1, validate: RED.validators.number() }, discardOldest: { value: true },
       deadbandType: { value: 'none' }, deadbandValue: { value: 0, validate: RED.validators.number() },
       timestampMode: { value: 'source' },
       batchSize: { value: 500, validate: RED.validators.number() }, outputMode: { value: 'batch' },
+      resultDetail: { value: 'compact' },
       maxItemsPerSubscription: { value: 5000, validate: RED.validators.number() },
       callbackBatchSize: { value: 500, validate: RED.validators.number() }, callbackQueueSize: { value: 10000, validate: RED.validators.number() },
       callbackFlushIntervalMs: { value: 50, validate: RED.validators.number() },
-      queueMode: { value: 'all' }, overflowPolicy: { value: 'drop-oldest' },
+      queueMode: { value: 'latest' }, overflowPolicy: { value: 'drop-oldest' },
       lifetimeCount: { value: 120 }, maxKeepAliveCount: { value: 10 }, maxNotificationsPerPublish: { value: 0 },
       reconnectInterval: { value: 5000 }, name: { value: '' }
     },

@@ -1,6 +1,6 @@
 {
   "name": "@tier0/opcua-client",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "description": "High-scale OPC UA client nodes for Node-RED powered by open62541",
   "license": "Apache-2.0",
   "repository": {

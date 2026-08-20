@@ -28,7 +28,8 @@ module.exports = function registerWriteNode(RED) {
             operation: 'write',
             total: results.length,
             good: results.filter((item) => item.statusCode === 'Good').length,
-            clientDiagnostics: node.connection.client.getDiagnostics(),
+            clientDiagnostics: node.connection.getDiagnostics?.() ||
+              node.connection.client.getDiagnostics(),
           };
           send(msg);
         }

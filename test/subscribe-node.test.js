@@ -9,7 +9,7 @@ function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-function createHarness(serverLimit = 2) {
+function createHarness(serverLimit = 2, configOverrides = {}) {
   const client = new EventEmitter();
   const subscriptions = new Map();
   let nextSubscriptionId = 0;
@@ -90,6 +90,7 @@ function createHarness(serverLimit = 2) {
     outputMode: 'batch',
     callbackBatchSize: 3,
     callbackFlushIntervalMs: 20,
+    ...configOverrides,
   });
 
   async function input(message) {
@@ -245,4 +246,75 @@ test('waits for in-flight reconciliation before cleaning up on close', async () 
   assert.equal(harness.node.subscriptions.size, 0);
   assert.equal(harness.node.monitored.size, 0);
   assert.equal(harness.node.desired.size, 0);
+});
+
+test('compact output omits Browse, native handle, server timestamp, and subscription metadata', async () => {
+  const harness = createHarness(10, { resultDetail: 'compact' });
+  await harness.input({ payload: [
+    { nodeId: 'ns=2;s=A', alias: 'point-a', browsePath: 'Area/A', accessLevel: 3 },
+    { nodeId: 'ns=2;s=B', browsePath: 'Area/B', accessLevel: 3 },
+    { nodeId: 'ns=2;s=C', browsePath: 'Area/C', accessLevel: 3 },
+  ] });
+  harness.node.sent.length = 0;
+  const subscription = [...harness.subscriptions.values()][0];
+  subscription.callback({ changes: [
+    { nodeId: 'ns=2;s=A', value: 1, statusCode: 'Good', clientHandle: 1,
+      sourceTimestamp: '2026-08-20T00:00:00.000Z', serverTimestamp: '2026-08-20T00:00:01.000Z' },
+    { nodeId: 'ns=2;s=B', value: 2, statusCode: 'Good', clientHandle: 2,
+      sourceTimestamp: '2026-08-20T00:00:00.000Z' },
+    { nodeId: 'ns=2;s=C', value: 3, statusCode: 'Good', clientHandle: 3,
+      sourceTimestamp: '2026-08-20T00:00:00.000Z' },
+  ], diagnostics: { delivered: 3 } });
+
+  assert.deepEqual(harness.node.sent[0].payload[0], {
+    nodeId: 'ns=2;s=A', alias: 'point-a', value: 1, statusCode: 'Good',
+    sourceTimestamp: '2026-08-20T00:00:00.000Z',
+  });
+  assert.equal(harness.node.sent[0].payload[0].browsePath, undefined);
+  assert.equal(harness.node.sent[0].payload[0].subscriptionId, undefined);
+  assert.equal(harness.node.sent[0].opcua.resultDetail, 'compact');
+
+  await harness.close();
+});
+
+test('value-only batch preserves repeated changes with parallel identifiers', async () => {
+  const harness = createHarness(10, { resultDetail: 'value' });
+  await harness.input({ payload: [
+    { nodeId: 'ns=2;s=A', alias: 'point-a' },
+    { nodeId: 'ns=2;s=B' },
+  ] });
+  harness.node.sent.length = 0;
+  const subscription = [...harness.subscriptions.values()][0];
+  subscription.callback({ changes: [
+    { nodeId: 'ns=2;s=A', value: 1 },
+    { nodeId: 'ns=2;s=A', value: 2 },
+    { nodeId: 'ns=2;s=B', value: 3 },
+  ], diagnostics: { delivered: 3 } });
+
+  assert.deepEqual(harness.node.sent[0].payload, [1, 2, 3]);
+  assert.deepEqual(harness.node.sent[0].opcua.identifiers, [
+    'point-a', 'point-a', 'ns=2;s=B',
+  ]);
+  assert.equal(harness.node.sent[0].opcua.resultDetail, 'value');
+
+  await harness.close();
+});
+
+test('value-only single output keeps scalar value and queue summary without point metadata', async () => {
+  const harness = createHarness(10, { resultDetail: 'value', outputMode: 'single' });
+  await harness.input({ payload: [{ nodeId: 'ns=2;s=A', browsePath: 'Area/A' }] });
+  harness.node.sent.length = 0;
+  const subscription = [...harness.subscriptions.values()][0];
+  subscription.callback({
+    changes: [{ nodeId: 'ns=2;s=A', value: 42 }],
+    diagnostics: { delivered: 1 },
+  });
+
+  assert.equal(harness.node.sent[0].topic, 'ns=2;s=A');
+  assert.equal(harness.node.sent[0].payload, 42);
+  assert.equal(harness.node.sent[0].opcua.operation, 'change');
+  assert.equal(harness.node.sent[0].opcua.nodeId, undefined);
+  assert.equal(harness.node.sent[0].opcua.queue.delivered, 1);
+
+  await harness.close();
 });

@@ -22,6 +22,15 @@ test('registers no standalone point-list node', () => {
   assert.equal(fs.existsSync(path.join(root, 'nodes', 'point-list.html')), false);
 });
 
+test('all node editors provide bilingual Chinese and English help', () => {
+  for (const name of ['connection', 'browse', 'read', 'write', 'subscribe']) {
+    const html = read(`nodes/${name}.html`);
+    assert.match(html, new RegExp(`data-help-name="tier0-opcua-${name}"`));
+    assert.match(html, /<section lang="zh-CN">/);
+    assert.match(html, /<section lang="en">/);
+  }
+});
+
 test('Read and Write use one visible point list for manual and imported points', () => {
   for (const name of ['read', 'write']) {
     const html = read(`nodes/${name}.html`);
@@ -43,6 +52,15 @@ test('Read and Write use one visible point list for manual and imported points',
     assert.match(html, /id="node-input-indexRange"/);
     assert.match(html, /indexRange: \{ value: '' \}/);
   }
+});
+
+test('Read editor defaults new nodes to compact results and offers explicit detail modes', () => {
+  const html = read('nodes/read.html');
+  assert.match(html, /id="node-input-resultDetail"/);
+  assert.match(html, /resultDetail: \{ value: 'compact' \}/);
+  assert.match(html, /option value="compact">Compact/);
+  assert.match(html, /option value="value">Value only/);
+  assert.match(html, /option value="full">Full metadata/);
 });
 
 test('Browse editor contains a tri-state selectable node tree', () => {
@@ -75,6 +93,12 @@ test('Subscribe editor exposes automatic sharding and dual-threshold batching', 
   assert.match(html, /id="node-input-callbackFlushIntervalMs"/);
   assert.match(html, /callbackFlushIntervalMs: \{ value: 50/);
   assert.match(html, /timestampMode: \{ value: 'source'/);
+  assert.match(html, /id="node-input-resultDetail"/);
+  assert.match(html, /resultDetail: \{ value: 'compact'/);
+  assert.match(html, /queueSize: \{ value: 1/);
+  assert.match(html, /queueMode: \{ value: 'latest'/);
+  assert.match(html, /keeps the latest pending value per point/);
+  assert.match(html, /msg\.opcua\.identifiers/);
   assert.match(html, /one or more OPC UA subscriptions/);
 });
 
@@ -82,6 +106,9 @@ test('Connection editor exposes a bounded native command queue', () => {
   const html = read('nodes/connection.html');
   assert.match(html, /id="node-config-input-commandQueueSize"/);
   assert.match(html, /commandQueueSize: \{ value: 256/);
+  assert.match(html, /id="node-config-input-allowParallelSession"/);
+  assert.match(html, /allowParallelSession: \{ value: false/);
+  assert.match(html, /reuse one Connection configuration for one Session/);
 });
 
 test('Connection editor exposes strict secure endpoint discovery and trust settings', () => {
@@ -95,5 +122,12 @@ test('Connection editor exposes strict secure endpoint discovery and trust setti
   assert.match(html, /id="node-config-input-applicationUri"/);
   assert.match(html, /id="node-config-input-trustedCertificates"/);
   assert.match(html, /id="node-config-input-revocationList"/);
+  assert.match(html, /id="node-config-upload-certificate"/);
+  assert.match(html, /id="node-config-upload-privateKey"/);
+  assert.match(html, /id="node-config-upload-trustedCertificates"/);
+  assert.match(html, /id="node-config-upload-revocationList"/);
+  assert.match(html, /id="node-config-file-trustedCertificates"/);
+  assert.match(html, /'trustedCertificate', true/);
+  assert.match(html, /Runtime-visible paths may still be entered directly/);
   assert.match(html, /No endpoint advertises/);
 });

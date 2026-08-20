@@ -39,13 +39,48 @@
     <div class="form-row"><label for="node-input-indexRange">Index range</label><input type="text" id="node-input-indexRange" placeholder="For example 0:9 or 0:1,2:3"></div>
     <div class="form-row"><label for="node-input-batchSize">Batch size</label><input type="number" id="node-input-batchSize"></div>
     <div class="form-row"><label for="node-input-outputMode">Output</label><select id="node-input-outputMode"><option value="batch">Batch</option><option value="split">One message per point</option></select></div>
+    <div class="form-row"><label for="node-input-resultDetail">Result detail</label><select id="node-input-resultDetail"><option value="compact">Compact</option><option value="value">Value only</option><option value="full">Full metadata</option></select></div>
   </details>
   <div class="form-row"><label for="node-input-name">Name</label><input type="text" id="node-input-name"></div>
 </script>
 <script type="text/html" data-help-name="tier0-opcua-read">
-  <p>Add NodeIds to the point list or import JSON/CSV. Imported points are parsed and shown in the same list.</p>
-  <p>CSV requires a <code>nodeId</code> header. A JSON/CSV point list may also arrive dynamically in <code>msg.payload</code>.</p>
-  <p>Use <code>indexRange</code> (or legacy <code>range</code>) per point or in <code>msg.indexRange</code> to read part of an array or matrix.</p>
+  <section lang="zh-CN">
+    <h3>读取（Read）</h3>
+    <p>每收到一条输入消息执行一次 OPC UA Read。它不是定时器；读取频率由上游 Inject、Function 或其他节点的触发频率决定。</p>
+    <h4>输入</h4>
+    <ul>
+      <li>可在编辑器中添加 NodeId，或导入 JSON/CSV 点表；CSV 必须包含 <code>nodeId</code> 列。</li>
+      <li>也可通过 <code>msg.payload</code> 或 <code>msg.items</code> 动态传入点表。</li>
+      <li>单点读取可使用节点配置、<code>msg.nodeId</code> 或 <code>msg.topic</code>。</li>
+      <li><code>indexRange</code> 可读取数组或矩阵的指定范围。</li>
+    </ul>
+    <h4>输出</h4>
+    <ul>
+      <li><b>Compact</b>：NodeId/alias、值、状态码和源时间戳，推荐用于采集。</li>
+      <li><b>Value only</b>：批量时按点表顺序输出值数组，单点时输出标量。</li>
+      <li><b>Full metadata</b>：同时输出完整点表描述和客户端诊断，适合排障。</li>
+    </ul>
+    <p>大点表会按照 Batch size 和服务器 OperationLimits 自动拆分为批量服务请求，不会逐点建立连接。</p>
+  </section>
+  <hr>
+  <section lang="en">
+    <h3>Read</h3>
+    <p>Executes one OPC UA Read for each input message. It is not a timer; the upstream Inject, Function, or other node controls the read frequency.</p>
+    <h4>Input</h4>
+    <ul>
+      <li>Add NodeIds in the editor or import a JSON/CSV point list. CSV requires a <code>nodeId</code> column.</li>
+      <li>A dynamic point list may arrive in <code>msg.payload</code> or <code>msg.items</code>.</li>
+      <li>A single point may come from the node setting, <code>msg.nodeId</code>, or <code>msg.topic</code>.</li>
+      <li>Use <code>indexRange</code> to read part of an array or matrix.</li>
+    </ul>
+    <h4>Output</h4>
+    <ul>
+      <li><b>Compact</b>: NodeId/alias, value, status code, and source timestamp. Recommended for collection flows.</li>
+      <li><b>Value only</b>: A value array in point-list order for batch reads, or a scalar for one point.</li>
+      <li><b>Full metadata</b>: Full point descriptors and client diagnostics for troubleshooting.</li>
+    </ul>
+    <p>Large point lists are split according to Batch size and server OperationLimits. The node does not create one connection per point.</p>
+  </section>
 </script>
 <script type="text/javascript">
   RED.nodes.registerType('tier0-opcua-read', {
@@ -55,7 +90,8 @@
       nodeId: { value: '' }, pointList: { value: '' }, pointListFileName: { value: '' },
       indexRange: { value: '' },
       batchSize: { value: 500, validate: RED.validators.number() },
-      outputMode: { value: 'batch' }, name: { value: '' }
+      outputMode: { value: 'batch' }, resultDetail: { value: 'compact' },
+      name: { value: '' }
     },
     oneditprepare: function () {
       const points = new Map();

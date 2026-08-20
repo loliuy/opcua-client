@@ -12,6 +12,10 @@ High-scale OPC UA client nodes for Node-RED, backed by open62541 and designed fo
 
 The OPC UA server remains a separate service. This package contains client and collection nodes only.
 
+Every node includes bilingual Chinese and English guidance in the Node-RED Help
+sidebar, covering its purpose, message contract, key settings, and operational
+notes for industrial deployments.
+
 ## Point contract
 
 Browse output can be wired directly into Read or Subscribe. In the Read and Write editors, manually added and imported points appear in one editable list. Import accepts JSON/CSV, merges by NodeId, and immediately shows the parsed rows. Both nodes also accept arrays, JSON strings/buffers, or CSV strings/buffers dynamically:
@@ -35,6 +39,14 @@ Browse output can be wired directly into Read or Subscribe. In the Read and Writ
 
 Subscription commands are `replace`, `add`, `remove`, and `clear`. Read and Write split large arrays into configurable service batches; they do not loop over scalar OPC UA requests.
 
+New Read nodes default to compact results: `nodeId`, optional `alias`, `value`,
+`statusCode`, and `sourceTimestamp`. Browse metadata and subscription-only point
+settings are not repeated on every Read. **Value only** emits an array in point-
+list order for batch output and a scalar for single/split output. **Full
+metadata** preserves the original descriptor-rich output and includes client
+diagnostics. Flow JSON created before this option existed continues to use Full
+metadata until the node is edited and a result detail is selected.
+
 Subscription notifications use a bounded native C++ queue and cross into JavaScript in batches. In Node-RED batch mode, changes from every server Subscription are merged and emitted when 500 values are ready or the default 50 ms flush window expires. Queue options are:
 
 - `callbackBatchSize`: maximum changes per native callback and Node-RED output message.
@@ -45,6 +57,21 @@ Subscription notifications use a bounded native C++ queue and cross into JavaScr
 - `outputMode`: `batch` aggregates changes across Subscriptions; `single` preserves one message per change compatibility.
 
 `timestampMode` defaults to `source`, avoiding an unnecessary server timestamp on every high-rate notification. Advanced settings can request `both`, `server`, or `neither`. Notification outputs contain the changing value/status/timestamp plus useful custom point metadata such as `alias`; monitoring configuration that is constant for the lifetime of the item is not repeated on every change.
+
+New Subscribe nodes default to compact notifications: `nodeId`, optional
+`alias`, `value`, `statusCode`, and `sourceTimestamp`. Browse metadata, native
+MonitoredItem handles, and sharding details are omitted. In batch **Value only**
+mode, `msg.payload` is a value array and `msg.opcua.identifiers` is the matching
+NodeId/alias array. Parallel arrays preserve order and repeated changes from the
+same point. **Full metadata** preserves the original output for diagnostics and
+Flow JSON created before this option existed continues to use it.
+
+New Subscribe nodes also default to server queue size `1`, `discardOldest=true`,
+and native queue mode `latest`. This keeps real-time state current during
+backpressure instead of replaying stale values. Set queue mode to `all` and
+increase the server queue size for pulses, alarms, counters, or history capture
+where every intermediate transition must be retained. Existing Flow JSON keeps
+its saved queue settings; runtime fallbacks remain compatible with older nodes.
 
 Large point sets are automatically split across server Subscriptions. `maxItemsPerSubscription` defaults to 5,000 and acts as the fallback safety limit. When the server advertises `MaxMonitoredItemsPerSubscription`, the node uses the smaller limit. Status messages expose `subscriptionCount`, `subscriptionIds`, `desired`, `monitored`, and `failed`.
 
@@ -63,6 +90,22 @@ Each Connection owns one native C++ thread. That thread creates and closes the `
 The native command queue defaults to 256 pending commands and is configurable as `Command queue` under advanced Connection settings. Queue capacity is hard: overload is rejected with an explicit error. A command that remains queued longer than the configured OPC UA request timeout is removed safely; an already-running service call is allowed to finish under open62541's request timeout. Closing a Connection stops accepting work, rejects pending commands, and performs OPC UA cleanup on the owner thread.
 
 `client.getDiagnostics().commandQueue` reports `depth`, `capacity`, `maxDepth`, `active`, `enqueued`, `completed`, `rejected`, and `timedOut`.
+
+## Session ownership and duplicate-connection governance
+
+One `tier0-opcua-connection` configuration node owns one native client and one
+OPC UA Session. Read, Write, Browse, and Subscribe nodes that reference that
+same configuration reuse the Session, including when the configuration is
+shared across Node-RED flow tabs. Different Connection configuration nodes are
+never merged implicitly because separate Sessions may be required for isolation.
+
+When equivalent Connection configurations target the same endpoint, security
+mode/policy, and user identity, the runtime emits a warning that an additional
+Session will be created. Reuse the existing Connection configuration to avoid
+duplicate Server load. Enable **Allow parallel Session** only when the extra
+Session is intentional. Read/Write diagnostics and subscription status outputs
+include `connectionGovernance`, with the equivalent and active configuration
+counts.
 
 ## Connection and subscription recovery
 
@@ -129,8 +172,14 @@ uses the selected secure endpoint and its advertised UserTokenPolicy.
 
 The Connection editor can call `GetEndpoints`, filters the response to the
 implemented policies, and selects an endpoint compatible with Anonymous or
-Username authentication. Certificate, private-key, trust-list, and CRL entries
-are filesystem paths visible to the Node-RED runtime.
+Username authentication. Client certificates, private keys, trusted Server/CA
+certificates, and CRLs can be uploaded from the editor. Uploaded files are kept
+under `<Node-RED userDir>/opcua-pki/<connection>/` with owner-only file
+permissions and the managed runtime path is stored in the Connection
+configuration. Existing and advanced deployments can still enter filesystem
+paths visible to the Node-RED runtime directly. Uploaded private-key bytes are
+never stored in the Flow JSON, and removing the Connection node removes its
+managed security-file directory.
 
 ## Offline installation
 
@@ -141,7 +190,7 @@ Node-RED Alpine image, the pinned open62541 v1.4.16 source archive, and its
 not contact npm or GitHub and does not invoke a compiler:
 
 ```bash
-npm install ./tier0-opcua-client-0.1.0.tgz --offline
+npm install ./tier0-opcua-client-0.4.0.tgz --offline
 ```
 
 The loader uses the bundled native addon directly. Set
