@@ -43,8 +43,33 @@
   <div class="form-row"><label for="node-input-name">Name</label><input type="text" id="node-input-name"></div>
 </script>
 <script type="text/html" data-help-name="tier0-opcua-browse">
-  <p>Loads the deployed OPC UA connection as a checkbox tree. Checking a parent selects every variable below it. Clearing a child makes its ancestors partially selected.</p>
-  <p>On input the node outputs every saved checked variable, ready for Read or Subscribe. Send <code>msg.opcua.liveBrowse=true</code> to bypass the saved selection and browse live.</p>
+  <section lang="zh-CN">
+    <h3>浏览（Browse）</h3>
+    <p>浏览 OPC UA 地址空间并选择变量点位。Browse 返回节点描述信息，不读取实时值。</p>
+    <h4>配置与输入</h4>
+    <ul>
+      <li>在编辑器中加载树并勾选变量；勾选父节点会选择其下所有变量。</li>
+      <li>收到任意输入消息后，默认输出已经保存的选择。</li>
+      <li>设置 <code>msg.opcua.liveBrowse=true</code> 可忽略保存的选择并实时浏览。</li>
+      <li><code>msg.nodeId</code> 或 <code>msg.topic</code> 可覆盖根 NodeId；默认根节点为 ObjectsFolder。</li>
+    </ul>
+    <h4>输出</h4>
+    <p><code>msg.payload</code> 是点位描述数组，包含 NodeId、名称、Browse 路径、数据类型和访问属性，可直接连接 Read 或 Subscribe。Paged 模式会分批输出，并通过 <code>msg.opcua.command</code> 标记 replace/add。</p>
+  </section>
+  <hr>
+  <section lang="en">
+    <h3>Browse</h3>
+    <p>Browses the OPC UA address space and selects Variable nodes. Browse returns node descriptors; it does not read live values.</p>
+    <h4>Configuration and input</h4>
+    <ul>
+      <li>Load the tree in the editor and check Variables. Checking a parent selects all Variables below it.</li>
+      <li>Any input message outputs the saved selection by default.</li>
+      <li>Set <code>msg.opcua.liveBrowse=true</code> to ignore the saved selection and perform a live Browse.</li>
+      <li><code>msg.nodeId</code> or <code>msg.topic</code> can override the root NodeId; the default root is ObjectsFolder.</li>
+    </ul>
+    <h4>Output</h4>
+    <p><code>msg.payload</code> is an array of point descriptors containing NodeId, names, Browse path, data type, and access attributes. It can feed Read or Subscribe directly. Paged mode emits multiple messages with replace/add in <code>msg.opcua.command</code>.</p>
+  </section>
 </script>
 <script type="text/javascript">
   RED.nodes.registerType('tier0-opcua-browse', {

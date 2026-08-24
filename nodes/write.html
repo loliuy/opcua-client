@@ -46,9 +46,33 @@
   <div class="form-row"><label for="node-input-name">Name</label><input type="text" id="node-input-name"></div>
 </script>
 <script type="text/html" data-help-name="tier0-opcua-write">
-  <p>Add NodeId, value, and data type rows or import JSON/CSV. Imported points are parsed and shown in the same list.</p>
-  <p>CSV requires <code>nodeId</code> and <code>value</code>; <code>dataType</code> is optional. A JSON/CSV point list may also arrive dynamically in <code>msg.payload</code>.</p>
-  <p>Use <code>indexRange</code> (or legacy <code>range</code>) per point or in <code>msg.indexRange</code> for partial array writes.</p>
+  <section lang="zh-CN">
+    <h3>写入（Write）</h3>
+    <p>向一个或多个 OPC UA Variable 写值。服务器必须允许当前用户写入，值也必须能够转换为目标数据类型。</p>
+    <h4>输入</h4>
+    <ul>
+      <li>单点：NodeId 来自节点配置、<code>msg.nodeId</code> 或 <code>msg.topic</code>，写入值来自 <code>msg.payload</code>。</li>
+      <li>批量：通过编辑器、JSON 或 CSV 提供 <code>nodeId</code>、<code>value</code> 和可选 <code>dataType</code>。</li>
+      <li>CSV 必须包含 <code>nodeId</code> 和 <code>value</code>；未指定类型时使用节点默认类型。</li>
+      <li><code>indexRange</code> 可部分写入数组或矩阵。</li>
+    </ul>
+    <h4>输出</h4>
+    <p>Batch 模式在 <code>msg.payload</code> 中返回每个 NodeId 的 StatusCode；Split 模式每个写入结果发送一条消息。应检查是否为 <code>Good</code>，不要只依赖节点未报异常。</p>
+  </section>
+  <hr>
+  <section lang="en">
+    <h3>Write</h3>
+    <p>Writes values to one or more OPC UA Variables. The current user must have write access and each value must be convertible to the target data type.</p>
+    <h4>Input</h4>
+    <ul>
+      <li>Single point: NodeId comes from the node setting, <code>msg.nodeId</code>, or <code>msg.topic</code>; the value comes from <code>msg.payload</code>.</li>
+      <li>Batch: Supply <code>nodeId</code>, <code>value</code>, and optional <code>dataType</code> through the editor, JSON, or CSV.</li>
+      <li>CSV requires <code>nodeId</code> and <code>value</code>. The node default type is used when <code>dataType</code> is omitted.</li>
+      <li>Use <code>indexRange</code> for partial array or matrix writes.</li>
+    </ul>
+    <h4>Output</h4>
+    <p>Batch mode returns one StatusCode per NodeId in <code>msg.payload</code>. Split mode sends one message per write result. Check for <code>Good</code>; do not treat the absence of a node error as proof that every item succeeded.</p>
+  </section>
 </script>
 <script type="text/javascript">
   RED.nodes.registerType('tier0-opcua-write', {

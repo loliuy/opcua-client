@@ -1,6 +1,8 @@
 'use strict';
 
 const { OpcUaClient, discoverEndpoints } = require('../lib/client');
+const { ConnectionRegistry } = require('../lib/connection-registry');
+const { SecurityFileStore } = require('../lib/security-file-store');
 
 function pathList(value) {
   const source = Array.isArray(value) ? value : String(value || '').split(/\r?\n|;/);
@@ -37,6 +39,28 @@ function clientOptions(config, credentials = {}) {
 }
 
 module.exports = function registerConnectionNode(RED) {
+  const connectionRegistry = new ConnectionRegistry();
+  const securityFileStore = new SecurityFileStore({ userDir: RED.settings?.userDir });
+
+  RED.httpAdmin.post(
+    '/opcua-client/security-files',
+    RED.auth.needsPermission('opcua-client.security-files.write'),
+    async (req, res) => {
+      try {
+        const file = await securityFileStore.save(req.body || {});
+        res.send({ file });
+      } catch (error) {
+        const status = error?.code === 'OPCUA_SECURITY_FILE_TOO_LARGE'
+          ? 413
+          : String(error?.code || '').startsWith('OPCUA_SECURITY_FILE_') ? 400 : 500;
+        res.status(status).send({
+          error: error.message || String(error),
+          code: error.code || 'OPCUA_SECURITY_FILE_UPLOAD_FAILED',
+        });
+      }
+    }
+  );
+
   RED.httpAdmin.post(
     '/opcua-client/endpoints',
     RED.auth.needsPermission('opcua-client.discovery'),
@@ -103,17 +127,51 @@ module.exports = function registerConnectionNode(RED) {
     RED.nodes.createNode(this, config);
     const node = this;
 
-    node.client = new OpcUaClient(clientOptions(config, node.credentials));
-
-    node.client.on('fault', (error) => node.warn(`OPC UA connection fault: ${error.message}`));
-    node.client.on('state', (state) => {
-      if (state.state === 'failed') node.warn(`OPC UA connection failed: ${state.statusCode}`);
+    const options = clientOptions(config, node.credentials);
+    const registration = connectionRegistry.register(options);
+    node.client = new OpcUaClient(options);
+    node.getConnectionGovernance = () => ({
+      ...registration.diagnostics(),
+      allowParallelSession: config.allowParallelSession === true,
     });
-    node.on('close', async (done) => {
+    node.getDiagnostics = () => ({
+      ...node.client.getDiagnostics(),
+      connectionGovernance: node.getConnectionGovernance(),
+    });
+
+    if (registration.duplicate && config.allowParallelSession !== true) {
+      node.warn(
+        `Equivalent OPC UA Connection configuration detected for ${options.endpoint}; ` +
+        'this creates an additional Session. Reuse the existing Connection configuration ' +
+        'or enable "Allow parallel Session" when isolation is intentional.'
+      );
+    }
+
+    const onFault = (error) => node.warn(`OPC UA connection fault: ${error.message}`);
+    const onState = (state) => {
+      if (state.state === 'failed') node.warn(`OPC UA connection failed: ${state.statusCode}`);
+    };
+    node.client.on('fault', onFault);
+    node.client.on('state', onState);
+    node.on('close', async (removed, done) => {
+      if (typeof removed === 'function') {
+        done = removed;
+        removed = false;
+      }
+      node.client.off('fault', onFault);
+      node.client.off('state', onState);
+      registration.unregister();
       try {
         await node.client.disconnect();
       } catch (error) {
         node.warn(`OPC UA disconnect failed: ${error.message}`);
+      }
+      if (removed) {
+        try {
+          await securityFileStore.removeConnection(config.id);
+        } catch (error) {
+          node.warn(`OPC UA managed security file cleanup failed: ${error.message}`);
+        }
       }
       done();
     });

@@ -80,26 +80,39 @@ OPC UA Server 节点不在本仓库范围内，继续使用独立容器。
 
 20,000 点故障注入验收：真实服务停止并重启后，Subscribe 节点重建 4 个 Subscription 和 20,000/20,000 个 MonitoredItem，失败 0；恢复后 60,000/60,000 条原生通知送达、丢弃 0、最终值 20,000/20,000 收敛，恢复阶段峰值 RSS 175.04 MB。
 
+### P0.4b Session 所有权和重复连接治理
+
+- [x] 一个 Connection 配置节点只拥有一个原生客户端和一个 Session。
+- [x] Read、Write、Browse、Subscribe 通过引用同一个 Connection 配置复用 Session。
+- [x] 不跨不同 Connection 配置节点隐式合并，保留有意的 Session 隔离。
+- [x] 按 Endpoint、安全模式/策略和用户身份检测等价配置并告警额外 Session。
+- [x] 提供 `Allow parallel Session` 显式标记，诊断输出包含等价配置和活动配置数量。
+- [x] 配置节点关闭时移除共享客户端监听器并独立关闭自己的 Session。
+
+Node-RED 配置节点默认是全局作用域。建议同一 Flow 内所有 OPC UA 业务节点引用一个 Connection 配置；如需跨 Flow 复用，也应显式选择同一个配置。不同配置始终代表不同 Session，避免运行时根据相似配置进行不可见合并。
+
 ## P0：安全与交付
 
 ### P0.5 安全连接
 
 - [x] open62541 开启 OpenSSL 加密后端。
 - [x] 支持 None、Sign、SignAndEncrypt 和 Basic256Sha256。
-- [x] 密码和私钥密码使用 Node-RED credentials；证书、私钥、信任列表和 CRL 使用运行时可见路径。
+- [x] 密码和私钥密码使用 Node-RED credentials；证书、私钥、信任列表和 CRL 支持编辑器上传托管，也兼容运行时可见路径。
 - [x] 增加严格证书信任、CRL 和可操作错误提示。
 - [x] 增加 Endpoint Discovery、连接测试和真实安全端点集成测试入口。
 
-2026-08-19 阶段验证：安全配置、端点匹配、凭据传递和重连竞态单元测试通过；真实安全端点测试脚本已加入。使用本地 open62541 `v1.4.16` tag 和 Node-RED 22 Docker 镜像内头文件，OpenSSL open62541 静态库及 N-API 插件已编译通过；仍需用现场证书执行 `npm run test:secure`。
+2026-08-20 阶段验证：安全配置、端点匹配、凭据传递和重连竞态单元测试通过；证书、私钥、信任链和 CRL 支持上传到 Node-RED userDir 下的隔离托管目录，同时保留手填运行时路径。真实安全端点测试脚本已加入。使用本地 open62541 `v1.4.16` tag 和 Node-RED 22 Docker 镜像内头文件，OpenSSL open62541 静态库及 N-API 插件已编译通过；仍需用现场证书执行 `npm run test:secure`。
 
 ### P0.6 npm 与 Enterprise 离线交付
 
 - [ ] 发布 `@tier0/opcua-client`。
-- [ ] 离线包携带固定版本 open62541 源码或预编译产物，安装时不访问 GitHub。
+- [x] npm 离线包携带 Linux x64 musl 预编译插件、固定版本 open62541 源码和 node-addon-api，支持断网安装且不访问 GitHub。
 - [ ] Enterprise `packages.txt` 改为离线 tgz。
 - [ ] 更新 palette 隐藏逻辑，识别 `@tier0/opcua-client` 和 `tier0-opcua-*`。
 - [ ] 更新 Node-RED 镜像编译依赖和安装/升级回归。
 - [ ] 验证全新安装、升级安装、失败后再次运行 `bin/nodered-packages.sh`。
+
+2026-08-19 阶段验证：生成约 5 MB 的 `@tier0/opcua-client@0.1.0` 离线 tgz，包含 `linux-x64-musl` N-API 预编译模块、open62541 `v1.4.16` 完整源码与 MPL-2.0 许可证、捆绑的 node-addon-api。使用 `--network none` 和空 npm cache，分别在 Node-RED 4.1.2 / Node 20.19.6 与 Node-RED 4.1.10 / Node 22.22.2 Alpine 容器中完成 `npm install --offline` 和原生导出加载验证，未执行编译或联网。
 
 ## P1：原版常用能力
 
