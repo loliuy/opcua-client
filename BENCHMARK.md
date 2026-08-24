@@ -132,3 +132,30 @@ The same deployed Flow was tested with a separate native client generating the f
 Write CSV parsing was then changed from multiple whole-payload arrays and object copies to a single line scan that constructs compact final write descriptors. Two mixed Node-RED runs, each producing CSV and executing all 100,000 writes inside the Flow, recorded stable peaks of 226.73 MB and 226.06 MB. The immediately preceding fresh-process repeat peaked at 362.29 MB, so the repeatable peak reduction was approximately 37.6%. The optimized repeat recorded Write P50/P95 of 1,410/1,769 ms, delivered 120,000/120,000 native notifications with zero drops, and converged 20,000/20,000 final values. These are process-RSS engineering measurements; allocator and garbage-collector behavior still require production baselines on the target Node-RED image.
 
 The 20,000-point outage acceptance stopped and restarted the real OPC UA fixture after the initial four Subscriptions were created. The Subscribe node rebuilt exactly four Subscriptions with 20,000/20,000 MonitoredItems and zero failures. Two subsequent complete write rounds plus the rebuilt initial values delivered 60,000/60,000 native notifications with zero drops and final convergence for all 20,000 points. Recovery-phase RSS peaked at 175.04 MB and the complete run at 184.5 MB. The recovery status explicitly reported `rebuilt=true` and `dataGapPossible=true` because a server-side subscription rebuild cannot guarantee changes that occurred during the outage.
+
+## 0.5.0 knee-point benchmark
+
+Recorded on 2026-08-24 with Node-RED 4.1.10, Node.js 22.22.2, open62541 1.4.16, and package 0.5.0. Every tier used a fresh Node-RED process constrained to 2 vCPU and 2 GB. The server and clients used security mode `None` over container loopback. Service batches contained 500 nodes, each server Subscription contained at most 5,000 MonitoredItems, publishing and sampling intervals were 100 ms, and an independent native client changed every monitored value so the Node-RED Subscribe path could be measured without CSV construction in the Write node.
+
+| Points | Read P50 / P95 | External write P50 / P95 | Subscribe setup | Native notifications | Max callback lag | Node-RED peak RSS |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 5,000 | 195 / 206 ms | 195 / 196 ms | 232 ms | 30,000, 0 dropped | 0.21 ms | 132.4 MB |
+| 10,000 | 411 / 467 ms | 392 / 396 ms | 475 ms | 60,000, 0 dropped | 1.00 ms | 153.4 MB |
+| 20,000 | 817 / 852 ms | 788 / 792 ms | 915 ms | 120,000, 0 dropped | 2.42 ms | 182.1 MB |
+| 30,000 | 1,263 / 1,274 ms | 1,208 / 1,219 ms | 1,523 ms | 180,000, 0 dropped | 2.18 ms | 194.4 MB |
+| 40,000 | 1,673 / 1,701 ms | 1,753 / 1,795 ms | 1,889 ms | 240,000, 0 dropped | 2.27 ms | 218.8 MB |
+| 60,000 | 2,521 / 2,556 ms | 2,590 / 2,641 ms | 2,860 ms | 360,000, 0 dropped | 5.07 ms | 261.3 MB |
+| 100,000 | 4,215 / 4,263 ms | 4,758 / 4,884 ms | 5,174 ms | 600,000, 0 dropped | 1.64 ms | 391.4 MB |
+| 150,000 | 6,353 / 6,470 ms | 8,045 / 8,137 ms | 7,582 ms | 600,000, 0 dropped | 27.53 ms | 463.2 MB |
+| 175,000 | 7,488 ms | 11,864 ms | 9,290 ms | 525,000, 0 dropped | 1.91 ms | 526.7 MB |
+| 200,000 | 8,485 / 8,663 ms | 42,410 / 43,425 ms | 10,968 ms | 800,000, 0 dropped | 1.73 ms | 564.0 MB |
+
+The 5,000 through 100,000 Read results remain close to 23,000-25,000 values per second. A one-second full-poll target therefore crosses its practical boundary between 20,000 and 30,000 points even though larger batches remain correct. Subscription creation stays near 18,000-22,000 MonitoredItems per second through 200,000 points.
+
+The coupled server/client system begins a soft knee around 150,000 monitored points. At that tier callback lag repeatedly reached about 27 ms and the default 100,000-entry NodeId cache started heavy eviction. Increasing the cache to 200,000 removed all evictions and improved Read P50 from 6,524 ms to 6,353 ms, but raised peak RSS from 425 MB to 463 MB and did not remove the callback-lag spike. Cache size is therefore a secondary tuning control, not the main scale limit.
+
+The sharp knee occurred between 175,000 and 200,000 monitored points. Increasing the point set by 14% increased one full write from about 11.9 seconds to 42.4 seconds. Node-RED still delivered all 800,000 native notifications with zero drops at 200,000 points, so the collapse occurred first in the open62541 server's processing of value changes under a very large monitored set, rather than in the Node-RED callback queue. A Siemens WinCC server can reach its own knee much earlier or later depending on licensed limits, Session and Subscription quotas, security, hardware, and project load.
+
+The editor Browse API intentionally caps one tree request at 100,000 total nodes. A namespace containing approximately 100,000 variables plus their Area objects therefore cannot be rendered as one complete selectable tree. Browse a narrower Area/root or import the point list instead of raising this UI protection.
+
+For production, keep a one-second full Read at or below roughly 20,000 points per Connection on equivalent hardware. For Subscribe, 50,000-60,000 monitored points per Connection is a conservative local-loopback engineering envelope with substantial margin below the observed system knee. Do not automatically add Sessions to exceed it: first verify the target server's Session, Subscription, MonitoredItem, publish, and sampling limits. Above 100,000 points, raise `nodeIdCacheSize` only with a corresponding memory budget and test the real server under the expected change rate and security policy.

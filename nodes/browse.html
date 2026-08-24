@@ -36,6 +36,8 @@
     <div class="form-row"><label for="node-input-variablesOnly">Variables only</label><input type="checkbox" id="node-input-variablesOnly" style="width:auto"></div>
     <div class="form-row"><label for="node-input-maxDepth">Maximum depth</label><input type="number" id="node-input-maxDepth"></div>
     <div class="form-row"><label for="node-input-maxNodes">Maximum nodes</label><input type="number" id="node-input-maxNodes"></div>
+    <div class="form-row"><label for="node-input-browseBatchSize">Browse batch</label><input type="number" id="node-input-browseBatchSize"></div>
+    <div class="form-row"><label for="node-input-referencesPerNode">References / page</label><input type="number" id="node-input-referencesPerNode"></div>
     <div class="form-row"><label for="node-input-attributeBatchSize">Attribute batch</label><input type="number" id="node-input-attributeBatchSize"></div>
     <div class="form-row"><label for="node-input-outputMode">Output</label><select id="node-input-outputMode"><option value="all">All selected points</option><option value="paged">Paged selected points</option></select></div>
     <div class="form-row"><label for="node-input-pageSize">Page size</label><input type="number" id="node-input-pageSize"></div>
@@ -54,7 +56,7 @@
       <li><code>msg.nodeId</code> 或 <code>msg.topic</code> 可覆盖根 NodeId；默认根节点为 ObjectsFolder。</li>
     </ul>
     <h4>输出</h4>
-    <p><code>msg.payload</code> 是点位描述数组，包含 NodeId、名称、Browse 路径、数据类型和访问属性，可直接连接 Read 或 Subscribe。Paged 模式会分批输出，并通过 <code>msg.opcua.command</code> 标记 replace/add。</p>
+    <p><code>msg.payload</code> 是点位描述数组，包含 NodeId、名称、Browse 路径、数据类型和访问属性，可直接连接 Read 或 Subscribe。Paged 模式会分批输出，并通过 <code>msg.opcua.command</code> 标记 replace/add。浏览被最大深度或节点数截断时，<code>msg.opcua.browse.truncated</code> 为 true；节点会释放未使用的 ContinuationPoint。</p>
   </section>
   <hr>
   <section lang="en">
@@ -68,7 +70,7 @@
       <li><code>msg.nodeId</code> or <code>msg.topic</code> can override the root NodeId; the default root is ObjectsFolder.</li>
     </ul>
     <h4>Output</h4>
-    <p><code>msg.payload</code> is an array of point descriptors containing NodeId, names, Browse path, data type, and access attributes. It can feed Read or Subscribe directly. Paged mode emits multiple messages with replace/add in <code>msg.opcua.command</code>.</p>
+    <p><code>msg.payload</code> is an array of point descriptors containing NodeId, names, Browse path, data type, and access attributes. It can feed Read or Subscribe directly. Paged mode emits multiple messages with replace/add in <code>msg.opcua.command</code>. When maximum depth or node count truncates a Browse, <code>msg.opcua.browse.truncated</code> is true; unused ContinuationPoints are released.</p>
   </section>
 </script>
 <script type="text/javascript">
@@ -78,6 +80,8 @@
       connection: { value: '', type: 'tier0-opcua-connection', required: true }, rootNodeId: { value: 'ns=0;i=85' },
       selectedNodes: { value: [] }, recursive: { value: true }, variablesOnly: { value: true },
       maxDepth: { value: 10, validate: RED.validators.number() }, maxNodes: { value: 10000, validate: RED.validators.number() },
+      browseBatchSize: { value: 100, validate: RED.validators.number() },
+      referencesPerNode: { value: 1000, validate: RED.validators.number() },
       attributeBatchSize: { value: 200, validate: RED.validators.number() }, outputMode: { value: 'all' },
       pageSize: { value: 500, validate: RED.validators.number() }, name: { value: '' }
     },
@@ -240,6 +244,8 @@
             rootNodeId: $('#node-input-rootNodeId').val() || 'ns=0;i=85',
             maxDepth: $('#node-input-maxDepth').val(),
             maxNodes: $('#node-input-maxNodes').val(),
+            browseBatchSize: $('#node-input-browseBatchSize').val(),
+            referencesPerNode: $('#node-input-referencesPerNode').val(),
             attributeBatchSize: $('#node-input-attributeBatchSize').val()
           })
         }).done((data) => {
@@ -248,6 +254,11 @@
             return;
           }
           renderTree(data.tree);
+          if (data.truncated) {
+            statusArea.text(`${data.total} node(s) loaded; truncated by ${data.truncationReason || 'server limit'}.`);
+          } else if (Array.isArray(data.failures) && data.failures.length) {
+            statusArea.text(`${data.total} node(s) loaded; ${data.failures.length} branch(es) failed.`);
+          }
         }).fail((request) => {
           const message = request.responseJSON && request.responseJSON.error || request.responseText || 'Browse failed';
           statusArea.text(message);

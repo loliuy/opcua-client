@@ -63,6 +63,18 @@ def main():
             ua.Variant([0.0, 1.0, 2.0, 3.0, 4.0], ua.VariantType.Double),
         )
         array_variable.set_writable()
+    int64_variable = folder.add_variable(
+        f"ns={namespace};s=Factory.Int64",
+        "Int64",
+        ua.Variant(9223372036854775807, ua.VariantType.Int64),
+    )
+    int64_variable.set_writable()
+    uint64_variable = folder.add_variable(
+        f"ns={namespace};s=Factory.UInt64",
+        "UInt64",
+        ua.Variant(18446744073709551615, ua.VariantType.UInt64),
+    )
+    uint64_variable.set_writable()
     areas = {}
     for index in range(point_count):
         area_index = index // area_size

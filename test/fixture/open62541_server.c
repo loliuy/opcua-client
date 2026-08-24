@@ -4,6 +4,7 @@
 #include <open62541/server_config_default.h>
 
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -65,6 +66,40 @@ addDoubleArray(UA_Server *server, UA_UInt16 namespaceIndex,
         NULL, NULL);
 }
 
+static UA_StatusCode
+addInt64Variable(UA_Server *server, UA_UInt16 namespaceIndex,
+                 const char *nodeId, const char *name,
+                 UA_NodeId parentNodeId, UA_Int64 value) {
+    UA_VariableAttributes attributes = UA_VariableAttributes_default;
+    attributes.displayName = UA_LOCALIZEDTEXT("en-US", (char *)name);
+    attributes.dataType = UA_TYPES[UA_TYPES_INT64].typeId;
+    attributes.accessLevel = UA_ACCESSLEVELMASK_READ | UA_ACCESSLEVELMASK_WRITE;
+    UA_Variant_setScalar(&attributes.value, &value, &UA_TYPES[UA_TYPES_INT64]);
+    return UA_Server_addVariableNode(
+        server, UA_NODEID_STRING(namespaceIndex, (char *)nodeId),
+        parentNodeId, UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT),
+        UA_QUALIFIEDNAME(namespaceIndex, (char *)name),
+        UA_NODEID_NUMERIC(0, UA_NS0ID_BASEDATAVARIABLETYPE), attributes,
+        NULL, NULL);
+}
+
+static UA_StatusCode
+addUInt64Variable(UA_Server *server, UA_UInt16 namespaceIndex,
+                  const char *nodeId, const char *name,
+                  UA_NodeId parentNodeId, UA_UInt64 value) {
+    UA_VariableAttributes attributes = UA_VariableAttributes_default;
+    attributes.displayName = UA_LOCALIZEDTEXT("en-US", (char *)name);
+    attributes.dataType = UA_TYPES[UA_TYPES_UINT64].typeId;
+    attributes.accessLevel = UA_ACCESSLEVELMASK_READ | UA_ACCESSLEVELMASK_WRITE;
+    UA_Variant_setScalar(&attributes.value, &value, &UA_TYPES[UA_TYPES_UINT64]);
+    return UA_Server_addVariableNode(
+        server, UA_NODEID_STRING(namespaceIndex, (char *)nodeId),
+        parentNodeId, UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT),
+        UA_QUALIFIEDNAME(namespaceIndex, (char *)name),
+        UA_NODEID_NUMERIC(0, UA_NS0ID_BASEDATAVARIABLETYPE), attributes,
+        NULL, NULL);
+}
+
 int
 main(int argc, char **argv) {
     const UA_UInt16 port = (UA_UInt16)(argc > 1 ? strtoul(argv[1], NULL, 10) : 4843);
@@ -104,6 +139,12 @@ main(int argc, char **argv) {
     status = addObject(server, namespaceIndex, "Factory", "Factory", objectsFolder);
     if(status == UA_STATUSCODE_GOOD)
         status = addDoubleArray(server, namespaceIndex, factoryNode);
+    if(status == UA_STATUSCODE_GOOD)
+        status = addInt64Variable(server, namespaceIndex, "Factory.Int64", "Int64",
+                                  factoryNode, INT64_MAX);
+    if(status == UA_STATUSCODE_GOOD)
+        status = addUInt64Variable(server, namespaceIndex, "Factory.UInt64", "UInt64",
+                                   factoryNode, UINT64_MAX);
 
     size_t currentArea = (size_t)-1;
     char currentAreaId[64] = {0};

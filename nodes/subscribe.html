@@ -2,12 +2,41 @@
   .opcua-advanced { margin: 8px 0 12px; }
   .opcua-advanced summary { cursor: pointer; font-weight: 600; padding: 6px 0; }
   .opcua-standard-note { margin: 0 0 10px 105px; color: var(--red-ui-form-text-color, #666); font-size: 0.9em; }
+  .opcua-point-editor { box-sizing: border-box; display: inline-block; vertical-align: top; width: calc(100% - 110px); }
+  .opcua-point-toolbar { display: flex; gap: 6px; margin-bottom: 8px; }
+  .opcua-point-add { display: flex; gap: 6px; margin-bottom: 8px; }
+  .opcua-point-add input { flex: 1; min-width: 0; }
+  .opcua-point-list { border: 1px solid var(--red-ui-form-input-border-color, #ccc); border-radius: 2px; box-sizing: border-box; height: 180px; list-style: none; margin: 0 !important; overflow: auto; padding: 0 !important; width: 100%; }
+  .opcua-point-list li { align-items: center; border-bottom: 1px solid var(--red-ui-secondary-border-color, #eee); display: flex; gap: 8px; min-height: 34px; padding: 4px 8px; }
+  .opcua-point-list li:last-child { border-bottom: 0; }
+  .opcua-point-list .opcua-point-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .opcua-point-list .opcua-point-empty { color: var(--red-ui-form-placeholder-color, #888); justify-content: center; }
+  .opcua-point-list .opcua-point-remove { border: 0; color: var(--red-ui-text-color, #555); flex: 0 0 auto; }
+  .opcua-point-status { color: var(--red-ui-form-text-color, #666); font-size: 0.9em; margin-top: 5px; }
 </style>
 <script type="text/html" data-template-name="tier0-opcua-subscribe">
   <div class="form-row"><label for="node-input-connection">Connection</label><input type="text" id="node-input-connection"></div>
-  <div class="form-row"><label for="node-input-nodeId">NodeId</label><input type="text" id="node-input-nodeId" placeholder="Optional when input supplies points"></div>
+  <input type="hidden" id="node-input-nodeId">
+  <input type="hidden" id="node-input-pointList">
+  <input type="hidden" id="node-input-pointListFileName">
+  <input type="file" id="node-input-pointFile" accept=".json,.csv,application/json,text/csv" style="display:none">
+  <div class="form-row">
+    <label>Points</label>
+    <div class="opcua-point-editor">
+      <div class="opcua-point-toolbar">
+        <button type="button" class="red-ui-button" id="node-input-importPointList"><i class="fa fa-upload"></i> Import</button>
+        <button type="button" class="red-ui-button" id="node-input-clearPointList"><i class="fa fa-trash"></i> Clear all</button>
+      </div>
+      <div class="opcua-point-add">
+        <input type="text" id="node-input-newPointNodeId" placeholder="NodeId, for example ns=2;s=Machine.Speed">
+        <button type="button" class="red-ui-button" id="node-input-addPoint"><i class="fa fa-plus"></i> Add</button>
+      </div>
+      <ol class="opcua-point-list" id="node-input-pointListItems"></ol>
+      <div class="opcua-point-status" id="node-input-pointListStatus">0 points</div>
+    </div>
+  </div>
   <div class="form-row"><label for="node-input-samplingInterval">Sampling (ms)</label><input type="number" id="node-input-samplingInterval"></div>
-  <div class="opcua-standard-note">Standard mode keeps the latest pending value per point, shards large point sets, batches changes, and automatically restores them after reconnect.</div>
+  <div class="opcua-standard-note">Saved points start automatically after deploy. Repeated identical point lists are reconciled without rebuilding server subscriptions.</div>
   <details class="opcua-advanced">
     <summary>Advanced subscription and queue settings</summary>
     <div class="form-row"><label for="node-input-publishingInterval">Publishing interval</label><input type="number" id="node-input-publishingInterval"></div>
@@ -33,7 +62,7 @@
     <h3>订阅（Subscribe）</h3>
     <p>创建 OPC UA Subscription 和 MonitoredItems，由服务器在值变化时推送通知；它不是客户端定时 Read。大量点位会按照服务器限制自动拆分到多个 Subscription。</p>
     <h4>输入与命令</h4>
-    <p>点表可来自数组、JSON、CSV 或 Browse 输出。通过 <code>msg.opcua.command</code> 使用 <code>replace</code>、<code>add</code>、<code>remove</code>、<code>clear</code> 动态管理点位。</p>
+    <p>可直接保存或导入 JSON/CSV 点表；部署后自动建立订阅。点表也可来自消息或 Browse 输出，通过 <code>msg.opcua.command</code> 使用 <code>replace</code>、<code>add</code>、<code>remove</code>、<code>clear</code> 动态管理点位。重复的相同点表不会重建 Subscription。</p>
     <h4>时间与队列</h4>
     <ul>
       <li><b>Sampling</b>：服务器检查 MonitoredItem 的请求间隔。</li>
@@ -55,7 +84,7 @@
     <h3>Subscribe</h3>
     <p>Creates one or more OPC UA subscriptions and MonitoredItems so the server sends data-change notifications. It is not a periodic client Read. Large point sets are automatically sharded across Subscriptions according to server limits.</p>
     <h4>Input and commands</h4>
-    <p>Point lists may come from arrays, JSON, CSV, or Browse output. Use <code>replace</code>, <code>add</code>, <code>remove</code>, or <code>clear</code> in <code>msg.opcua.command</code> to manage points dynamically.</p>
+    <p>Save or import a JSON/CSV point list to start automatically after deploy. Point lists may also come from messages or Browse output. Use <code>replace</code>, <code>add</code>, <code>remove</code>, or <code>clear</code> in <code>msg.opcua.command</code> to manage points dynamically. Repeating an unchanged list does not rebuild the server Subscription.</p>
     <h4>Timing and queues</h4>
     <ul>
       <li><b>Sampling</b>: Requested interval at which the server checks a MonitoredItem.</li>
@@ -77,7 +106,8 @@
   RED.nodes.registerType('tier0-opcua-subscribe', {
     category: 'OPC UA', color: '#c7e9f1', inputs: 1, outputs: 1, icon: 'bridge.png',
     defaults: {
-      connection: { value: '', type: 'tier0-opcua-connection', required: true }, nodeId: { value: '' },
+      connection: { value: '', type: 'tier0-opcua-connection', required: true },
+      nodeId: { value: '' }, pointList: { value: '' }, pointListFileName: { value: '' },
       publishingInterval: { value: 1000, validate: RED.validators.number() }, samplingInterval: { value: 1000, validate: RED.validators.number() },
       queueSize: { value: 1, validate: RED.validators.number() }, discardOldest: { value: true },
       deadbandType: { value: 'none' }, deadbandValue: { value: 0, validate: RED.validators.number() },
@@ -90,6 +120,134 @@
       queueMode: { value: 'latest' }, overflowPolicy: { value: 'drop-oldest' },
       lifetimeCount: { value: 120 }, maxKeepAliveCount: { value: 10 }, maxNotificationsPerPublish: { value: 0 },
       reconnectInterval: { value: 5000 }, name: { value: '' }
+    },
+    oneditprepare: function () {
+      const points = new Map();
+
+      const csvLine = (line) => {
+        const fields = [];
+        let value = '';
+        let quoted = false;
+        for (let index = 0; index < line.length; index += 1) {
+          const character = line[index];
+          if (character === '"') {
+            if (quoted && line[index + 1] === '"') { value += '"'; index += 1; }
+            else quoted = !quoted;
+          } else if (character === ',' && !quoted) {
+            fields.push(value.trim()); value = '';
+          } else value += character;
+        }
+        fields.push(value.trim());
+        return fields;
+      };
+
+      const parse = (content) => {
+        const text = String(content || '').replace(/^\uFEFF/, '').trim();
+        if (!text) return [];
+        if (text.startsWith('[') || text.startsWith('{')) {
+          const parsed = JSON.parse(text);
+          return Array.isArray(parsed) ? parsed : (Array.isArray(parsed.items) ? parsed.items : [parsed]);
+        }
+        const lines = text.split(/\r?\n/).filter((line) => line.trim() && !line.trimStart().startsWith('#'));
+        if (!lines.length) return [];
+        const headers = csvLine(lines.shift());
+        if (!headers.includes('nodeId')) throw new Error('CSV header must contain nodeId');
+        return lines.map((line) => {
+          const values = csvLine(line);
+          return Object.fromEntries(headers.map((header, index) => [header, values[index] || '']));
+        });
+      };
+
+      const normalize = (item) => {
+        const source = typeof item === 'string' ? { nodeId: item } : { ...(item || {}) };
+        source.nodeId = String(source.nodeId || source.topic || '').trim();
+        if (!source.nodeId) throw new Error('Point is missing nodeId');
+        return source;
+      };
+
+      const persist = () => {
+        const items = [...points.values()];
+        $('#node-input-pointList').val(items.length ? JSON.stringify(items) : '');
+        if (items.length) $('#node-input-nodeId').val('');
+        $('#node-input-pointListStatus').text(`${items.length} point${items.length === 1 ? '' : 's'}`);
+      };
+
+      const render = () => {
+        const list = document.getElementById('node-input-pointListItems');
+        list.textContent = '';
+        if (!points.size) {
+          const empty = document.createElement('li');
+          empty.className = 'opcua-point-empty';
+          empty.textContent = 'No saved points. Add a NodeId, import a file, or supply points by message.';
+          list.appendChild(empty);
+        } else {
+          const fragment = document.createDocumentFragment();
+          points.forEach((point, nodeId) => {
+            const row = document.createElement('li');
+            const text = document.createElement('span');
+            text.className = 'opcua-point-text';
+            text.textContent = point.alias ? `${point.alias} — ${nodeId}` : nodeId;
+            text.title = text.textContent;
+            const remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = 'red-ui-button opcua-point-remove';
+            remove.title = `Remove ${nodeId}`;
+            remove.innerHTML = '<i class="fa fa-times"></i>';
+            remove.addEventListener('click', () => { points.delete(nodeId); render(); });
+            row.append(text, remove);
+            fragment.appendChild(row);
+          });
+          list.appendChild(fragment);
+        }
+        persist();
+      };
+
+      const merge = (items) => {
+        items.forEach((item) => { const point = normalize(item); points.set(point.nodeId, point); });
+        render();
+      };
+
+      try {
+        const stored = $('#node-input-pointList').val();
+        if (stored) merge(parse(stored));
+        else if ($('#node-input-nodeId').val()) merge([{ nodeId: $('#node-input-nodeId').val() }]);
+        else render();
+      } catch (error) {
+        RED.notify(`Cannot load point list: ${error.message}`, 'error');
+        render();
+      }
+
+      $('#node-input-addPoint').on('click', () => {
+        try {
+          merge([{ nodeId: $('#node-input-newPointNodeId').val() }]);
+          $('#node-input-newPointNodeId').val('').focus();
+        } catch (error) { RED.notify(error.message, 'error'); }
+      });
+      $('#node-input-newPointNodeId').on('keydown', function (event) {
+        if (event.key === 'Enter') { event.preventDefault(); $('#node-input-addPoint').click(); }
+      });
+      $('#node-input-importPointList').on('click', () => $('#node-input-pointFile').click());
+      $('#node-input-pointFile').on('change', function () {
+        const file = this.files && this.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          try {
+            const imported = parse(reader.result);
+            merge(imported);
+            $('#node-input-pointListFileName').val(file.name);
+            RED.notify(`${imported.length} point(s) imported`, 'success');
+          } catch (error) { RED.notify(`Import failed: ${error.message}`, 'error'); }
+          $('#node-input-pointFile').val('');
+        };
+        reader.readAsText(file);
+      });
+      $('#node-input-clearPointList').on('click', () => {
+        points.clear();
+        $('#node-input-nodeId').val('');
+        $('#node-input-pointListFileName').val('');
+        render();
+      });
     },
     label: function () { return this.name || 'tier0-opcua-subscribe'; }
   });

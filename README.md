@@ -39,6 +39,8 @@ Browse output can be wired directly into Read or Subscribe. In the Read and Writ
 
 Subscription commands are `replace`, `add`, `remove`, and `clear`. Read and Write split large arrays into configurable service batches; they do not loop over scalar OPC UA requests.
 
+Subscribe nodes can save or import their own point list and establish it automatically after deploy. Repeating an unchanged `replace` command preserves existing server Subscriptions and MonitoredItems. Only added, removed, or monitoring-parameter-changed points are reconciled. A rejected point is reported in `failures` without stopping valid points, and requested versus server-revised publishing, sampling, lifetime, keepalive, and queue settings are included in subscription status output.
+
 New Read nodes default to compact results: `nodeId`, optional `alias`, `value`,
 `statusCode`, and `sourceTimestamp`. Browse metadata and subscription-only point
 settings are not repeated on every Read. **Value only** emits an array in point-
@@ -107,6 +109,13 @@ Session is intentional. Read/Write diagnostics and subscription status outputs
 include `connectionGovernance`, with the equivalent and active configuration
 counts.
 
+`connectionUsage` reports the current Read/Write/Browse/Subscribe consumer count
+and types, each consumer's last use, aggregate operation counts, and connection
+idle time. It is diagnostic only: `automaticIdleDisconnect` is false. A deployed
+Connection therefore remains stable for subscriptions until its configuration
+node is closed; deleting the last referencing flow is visible as a zero consumer
+count but does not race an idle timer.
+
 ## Connection and subscription recovery
 
 The native client reports secure-channel, session, connectivity-check, and subscription-inactivity transitions to a JavaScript connection supervisor. Recoverable channel interruptions keep the native client alive. Terminal failures replace the native client and retry with exponential backoff, 20% jitter, and the configured maximum interval. Operations fail fast with `OPCUA_RECONNECTING` while the connection is unavailable instead of building an unbounded request queue.
@@ -137,6 +146,12 @@ message or Write node identifies one target NodeId. A configured single
 `useInput` point behaves the same way. Set `msg.opcua.pointList = true` only when
 an array payload must be forced to mean a dynamic list of point descriptors.
 
+OPC UA Int64 and UInt64 values inside the JavaScript safe-integer range are
+returned as Numbers. Larger values are returned as exact decimal strings so
+totals and counters never silently lose precision. Use decimal strings for
+64-bit writes; unsafe Numbers, fractional integers, and values outside the OPC UA
+type range are rejected before a service request.
+
 ```json
 {
   "topic": "ns=2;s=Recipe.Steps",
@@ -153,6 +168,13 @@ An incoming point list takes priority over the point list saved in the node. Exi
 The Browse editor loads the address space through the deployed Connection node. Object nodes act as folders and Variable nodes are selectable outputs. Checking a parent selects every variable below it; clearing an individual child changes every affected ancestor to the half-selected state. The editor shows the selected/total variable count and provides branch expansion, name/path/NodeId filtering, Select all, and Clear actions.
 
 The selected Variable descriptors are saved with the Browse node. Each input message outputs the full saved selection so it can be wired directly into Read or Subscribe. Send `msg.opcua.liveBrowse = true` when a flow needs to ignore the saved selection and perform a new live Browse.
+
+Recursive Browse requests batch multiple parent nodes and honor the server's
+`MaxNodesPerBrowse` OperationLimit. `Browse batch` and `References / page` bound
+each request. If `Maximum depth` or `Maximum nodes` truncates a live Browse,
+`msg.opcua.browse.truncated` and `truncationReason` make the partial result
+explicit. Unused server ContinuationPoints are released before the operation
+finishes.
 
 Node editors show only the standard settings by default. Connection security/timeouts/cache, Browse limits/paging, Read/Write batching/output, and Subscribe queue/deadband tuning remain available under a closed **Advanced settings** section. Existing flows retain their stored advanced values.
 
@@ -190,7 +212,7 @@ Node-RED Alpine image, the pinned open62541 v1.4.16 source archive, and its
 not contact npm or GitHub and does not invoke a compiler:
 
 ```bash
-npm install ./tier0-opcua-client-0.4.0.tgz --offline
+npm install ./tier0-opcua-client-0.5.0.tgz --offline
 ```
 
 The loader uses the bundled native addon directly. Set
@@ -206,6 +228,11 @@ npm ci --ignore-scripts
 npm run build:offline-prebuild -- --nodedir=/usr/local
 npm pack
 ```
+
+Before publishing, `npm run test:release` runs the JavaScript, native, offline
+runtime, and deployed Node-RED suites when their test Server and Node-RED runtime
+are available. `npm pack` also reruns the JavaScript suite and rejects an
+incomplete offline package.
 
 See `THIRD_PARTY_NOTICES.md` for the bundled open62541 and node-addon-api
 licenses.

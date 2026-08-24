@@ -81,6 +81,34 @@ test('uses batch native services and preserves request order', async () => {
   await client.disconnect();
 });
 
+test('preserves Browse arrays while exposing truncation and resource diagnostics', async () => {
+  const nativeItems = [{ nodeId: 'ns=2;s=A' }];
+  nativeItems.truncated = true;
+  nativeItems.truncationReason = 'maxNodes';
+  nativeItems.serviceCalls = 3;
+  nativeItems.browseBatchSize = 7;
+  nativeItems.releasedContinuationPoints = 2;
+  nativeItems.browseFailures = [{ nodeId: 'ns=2;s=Bad', statusCode: 'BadNodeIdUnknown' }];
+  setAddonForTests({
+    connectAsync: async () => 8,
+    browseAsync: async () => nativeItems,
+    disconnectAsync: async () => {},
+  });
+  const client = new OpcUaClient({ endpoint: 'opc.tcp://test:4840' });
+  const items = await client.browse({ maxNodes: 1 });
+  assert.deepEqual(items, [{ nodeId: 'ns=2;s=A' }]);
+  assert.deepEqual(items.diagnostics, {
+    truncated: true,
+    truncationReason: 'maxNodes',
+    serviceCalls: 3,
+    browseBatchSize: 7,
+    releasedContinuationPoints: 2,
+    failures: [{ nodeId: 'ns=2;s=Bad', statusCode: 'BadNodeIdUnknown' }],
+  });
+  assert.deepEqual(client.getDiagnostics().browse, items.diagnostics);
+  await client.disconnect();
+});
+
 test('creates one subscription and adds monitored items in batches', async () => {
   let subscriptions = 0;
   const batches = [];

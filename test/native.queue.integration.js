@@ -7,7 +7,10 @@ const { spawn } = require('node:child_process');
 const addon = require('../build/Release/opcua_open62541.node');
 
 async function fixture(port) {
-  const child = spawn('python3', [path.join(__dirname, 'fixture', 'server.py'), String(port), '20']);
+  const nativeServer = process.env.OPCUA_TEST_SERVER_BINARY;
+  const child = spawn(nativeServer || 'python3', nativeServer
+    ? [String(port), '20', '500', '0']
+    : [path.join(__dirname, 'fixture', 'server.py'), String(port), '20']);
   let output = '';
   let errors = '';
   child.stdout.on('data', (data) => { output += data; });
@@ -18,7 +21,10 @@ async function fixture(port) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   const match = output.match(/RUNNING (opc\.tcp:\/\/\S+) \S+ ns=(\d+);\S+/);
-  if (!match) throw new Error(`Fixture did not start: ${errors}`);
+  if (!match) {
+    child.kill('SIGTERM');
+    throw new Error(`Fixture did not start: ${errors}`);
+  }
   return { child, endpoint: match[1], namespace: Number(match[2]) };
 }
 

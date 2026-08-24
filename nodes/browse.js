@@ -36,16 +36,22 @@ module.exports = function registerBrowseNode(RED) {
 
       activeEditorBrowses.add(connectionId);
       try {
+        connection.markUsed?.('editor-browse');
         const items = await connection.client.browse({
           rootNodeId,
           recursive: true,
           variablesOnly: false,
           maxDepth: positiveInteger(body.maxDepth, 10, 50),
           maxNodes: positiveInteger(body.maxNodes, 10000, 100000),
+          browseBatchSize: positiveInteger(body.browseBatchSize, 100, 5000),
+          referencesPerNode: positiveInteger(body.referencesPerNode, 1000, 10000),
           attributeBatchSize: positiveInteger(body.attributeBatchSize, 200, 5000),
         });
         const tree = buildBrowseTree(items, rootNodeId);
-        res.send({ tree, total: items.length, rootNodeId });
+        res.send({
+          tree, total: items.length, rootNodeId,
+          ...(items.diagnostics || {}),
+        });
       } catch (error) {
         const status = error?.code === 'OPCUA_RECONNECTING' ? 503 : 500;
         res.status(status).send({ error: error.message || String(error) });
@@ -59,11 +65,15 @@ module.exports = function registerBrowseNode(RED) {
     RED.nodes.createNode(this, config);
     const node = this;
     node.connection = RED.nodes.getNode(config.connection);
+    const consumer = node.connection?.registerConsumer?.('browse', {
+      nodeId: config.id, name: config.name,
+    });
 
     node.on('input', async (msg, send, done) => {
       if (!node.connection) return done(new Error('OPC UA connection not configured'));
 
       try {
+        consumer?.markUsed('browse');
         const rootNodeId = msg.nodeId || msg.topic || config.rootNodeId || 'ns=0;i=85';
         node.status({ fill: 'blue', shape: 'dot', text: 'browsing' });
         const configuredSelection = selectedVariables(config.selectedNodes);
@@ -75,8 +85,11 @@ module.exports = function registerBrowseNode(RED) {
             maxNodes: Number(config.maxNodes) || 10000,
             variablesOnly: config.variablesOnly !== false,
             namespaceIndexes: msg.opcua?.namespaceIndexes || [],
+            browseBatchSize: Number(config.browseBatchSize) || 100,
+            referencesPerNode: Number(config.referencesPerNode) || 1000,
             attributeBatchSize: Number(config.attributeBatchSize) || 200,
           });
+        const browseDiagnostics = useSelection ? null : points.diagnostics || null;
 
         const outputMode = config.outputMode || 'all';
         if (outputMode === 'paged') {
@@ -93,6 +106,7 @@ module.exports = function registerBrowseNode(RED) {
               pages: pages.length,
               done: index === pages.length - 1,
               total: points.length,
+              ...(browseDiagnostics ? { browse: browseDiagnostics } : {}),
             },
           }));
         } else {
@@ -104,16 +118,29 @@ module.exports = function registerBrowseNode(RED) {
             rootNodeId,
             done: true,
             total: points.length,
+            ...(browseDiagnostics ? { browse: browseDiagnostics } : {}),
           };
           send(msg);
         }
 
-        node.status({ fill: 'green', shape: 'dot', text: `${points.length} points` });
+        const partial = browseDiagnostics?.truncated || browseDiagnostics?.failures?.length;
+        node.status({
+          fill: partial ? 'yellow' : 'green', shape: partial ? 'ring' : 'dot',
+          text: `${points.length} points` +
+            (browseDiagnostics?.truncated
+              ? ` / truncated: ${browseDiagnostics.truncationReason}` : ''),
+        });
         done();
       } catch (error) {
         node.status({ fill: 'red', shape: 'ring', text: error.message });
         done(error);
       }
+    });
+
+    node.on('close', (removed, done) => {
+      if (typeof removed === 'function') done = removed;
+      consumer?.release();
+      done?.();
     });
   }
 

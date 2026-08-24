@@ -23,12 +23,17 @@ async function fixture(port) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   const match = output.match(/RUNNING (opc\.tcp:\/\/\S+) (ns=\S+) \S+ \d+(?: (ns=\S+))?/);
-  if (!match) throw new Error(`Fixture did not start: ${errors}`);
+  if (!match) {
+    childProcess.kill('SIGTERM');
+    throw new Error(`Fixture did not start: ${errors}`);
+  }
   return {
     process: childProcess,
     endpoint: match[1],
     nodeId: match[2],
     arrayNodeId: match[3],
+    int64NodeId: `${match[2].split(';')[0]};s=Factory.Int64`,
+    uint64NodeId: `${match[2].split(';')[0]};s=Factory.UInt64`,
   };
 }
 
@@ -51,11 +56,48 @@ async function main() {
       rootNodeId: 'ns=0;i=85', recursive: true, variablesOnly: true, maxDepth: 4, maxNodes: 100,
     });
     assert(browsed.some((item) => item.nodeId === server.nodeId));
+    assert.equal(browsed.browseBatchSize, 7);
+    assert(browsed.serviceCalls > 0);
+
+    const truncatedBrowse = await addon.browseAsync(clientId, {
+      rootNodeId: 'ns=0;i=85', recursive: true, variablesOnly: true,
+      maxDepth: 10, maxNodes: 3, browseBatchSize: 100,
+      referencesPerNode: 1,
+    });
+    assert.equal(truncatedBrowse.length, 3);
+    assert.equal(truncatedBrowse.truncated, true);
+    assert.equal(truncatedBrowse.truncationReason, 'maxNodes');
+    assert.equal(truncatedBrowse.browseBatchSize, 7);
+    assert(truncatedBrowse.releasedContinuationPoints > 0);
 
     const read = await addon.readManyAsync(clientId, [{ nodeId: server.nodeId }]);
     assert.equal(read[0].statusCode, 'Good');
     assert.equal(read[0].value, 0);
     await addon.readManyAsync(clientId, [{ nodeId: server.nodeId }]);
+
+    const wideIntegers = await addon.readManyAsync(clientId, [
+      { nodeId: server.int64NodeId }, { nodeId: server.uint64NodeId },
+    ]);
+    assert.equal(wideIntegers[0].dataType, 'Int64');
+    assert.equal(wideIntegers[0].value, '9223372036854775807');
+    assert.equal(wideIntegers[1].dataType, 'UInt64');
+    assert.equal(wideIntegers[1].value, '18446744073709551615');
+    const wideWrites = await addon.writeManyAsync(clientId, [
+      { nodeId: server.int64NodeId, value: '-9223372036854775808', dataType: 'Int64' },
+      { nodeId: server.uint64NodeId, value: '18446744073709551615', dataType: 'UInt64' },
+    ]);
+    assert(wideWrites.every((item) => item.statusCode === 'Good'));
+    const wideAfterWrite = await addon.readManyAsync(clientId, [
+      { nodeId: server.int64NodeId }, { nodeId: server.uint64NodeId },
+    ]);
+    assert.equal(wideAfterWrite[0].value, '-9223372036854775808');
+    assert.equal(wideAfterWrite[1].value, '18446744073709551615');
+    await assert.rejects(
+      async () => addon.writeManyAsync(clientId, [{
+        nodeId: server.int64NodeId, value: 9007199254740992, dataType: 'Int64',
+      }]),
+      /use|Invalid Int64|integer/i
+    );
 
     if (server.arrayNodeId) {
       const partialRead = await addon.readManyAsync(clientId, [
@@ -87,6 +129,9 @@ async function main() {
         changes.push(...(batch.changes || [batch]));
       }
     );
+    assert(subscription.revisedPublishingInterval > 0);
+    assert(subscription.revisedLifetimeCount > 0);
+    assert(subscription.revisedMaxKeepAliveCount > 0);
     const monitored = await addon.addMonitoredItemsAsync(
       clientId,
       subscription.subscriptionId,
@@ -94,6 +139,8 @@ async function main() {
       {}
     );
     assert.equal(monitored[0].statusCode, 'Good');
+    assert(monitored[0].revisedSamplingInterval >= 0);
+    assert(monitored[0].revisedQueueSize > 0);
     const secondMonitoredBatch = await addon.addMonitoredItemsAsync(
       clientId,
       subscription.subscriptionId,

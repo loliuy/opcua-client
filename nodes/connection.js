@@ -126,6 +126,58 @@ module.exports = function registerConnectionNode(RED) {
   function OpcUaConnectionNode(config) {
     RED.nodes.createNode(this, config);
     const node = this;
+    const dependentCleanups = new Set();
+    const consumers = new Map();
+    const operations = new Map();
+    let nextConsumerId = 1;
+    let lastUsedAt = null;
+    let totalOperations = 0;
+
+    function markUsed(operation = 'unknown', consumer) {
+      const now = Date.now();
+      const name = String(operation || 'unknown');
+      lastUsedAt = now;
+      totalOperations += 1;
+      operations.set(name, (operations.get(name) || 0) + 1);
+      if (consumer && consumers.has(consumer.id)) {
+        consumer.lastUsedAt = now;
+        consumer.operations += 1;
+      }
+    }
+
+    function connectionUsage() {
+      const consumerTypes = {};
+      for (const consumer of consumers.values()) {
+        consumerTypes[consumer.type] = (consumerTypes[consumer.type] || 0) + 1;
+      }
+      return {
+        consumerCount: consumers.size,
+        consumerTypes,
+        consumers: [...consumers.values()].map((consumer) => ({
+          id: consumer.nodeId || consumer.id,
+          type: consumer.type,
+          name: consumer.name || '',
+          registeredAt: new Date(consumer.registeredAt).toISOString(),
+          lastUsedAt: consumer.lastUsedAt == null
+            ? null : new Date(consumer.lastUsedAt).toISOString(),
+          operations: consumer.operations,
+        })),
+        lastUsedAt: lastUsedAt == null ? null : new Date(lastUsedAt).toISOString(),
+        idleMs: lastUsedAt == null ? null : Math.max(0, Date.now() - lastUsedAt),
+        totalOperations,
+        operations: Object.fromEntries(operations),
+        automaticIdleDisconnect: false,
+      };
+    }
+
+    function runDependentCleanup(record) {
+      if (!record.promise) {
+        record.promise = Promise.resolve()
+          .then(record.cleanup)
+          .finally(() => dependentCleanups.delete(record));
+      }
+      return record.promise;
+    }
 
     const options = clientOptions(config, node.credentials);
     const registration = connectionRegistry.register(options);
@@ -137,7 +189,41 @@ module.exports = function registerConnectionNode(RED) {
     node.getDiagnostics = () => ({
       ...node.client.getDiagnostics(),
       connectionGovernance: node.getConnectionGovernance(),
+      connectionUsage: connectionUsage(),
     });
+    node.getConnectionUsage = connectionUsage;
+    node.markUsed = (operation) => markUsed(operation);
+    node.registerConsumer = (type, details = {}) => {
+      const consumer = {
+        id: nextConsumerId++,
+        nodeId: String(details.nodeId || ''),
+        name: String(details.name || ''),
+        type: String(type || 'unknown'),
+        registeredAt: Date.now(),
+        lastUsedAt: null,
+        operations: 0,
+      };
+      consumers.set(consumer.id, consumer);
+      let released = false;
+      return {
+        markUsed(operation) {
+          if (!released) markUsed(operation || consumer.type, consumer);
+        },
+        release() {
+          if (released) return;
+          released = true;
+          consumers.delete(consumer.id);
+        },
+      };
+    };
+    node.registerDependentCleanup = (cleanup) => {
+      if (typeof cleanup !== 'function') {
+        throw new TypeError('OPC UA dependent cleanup must be a function');
+      }
+      const record = { cleanup, promise: null };
+      dependentCleanups.add(record);
+      return () => runDependentCleanup(record);
+    };
 
     if (registration.duplicate && config.allowParallelSession !== true) {
       node.warn(
@@ -161,6 +247,15 @@ module.exports = function registerConnectionNode(RED) {
       node.client.off('fault', onFault);
       node.client.off('state', onState);
       registration.unregister();
+      const cleanupResults = await Promise.allSettled(
+        [...dependentCleanups].map(runDependentCleanup)
+      );
+      for (const result of cleanupResults) {
+        if (result.status === 'rejected') {
+          node.warn(`OPC UA dependent cleanup failed: ${result.reason?.message || result.reason}`);
+        }
+      }
+      consumers.clear();
       try {
         await node.client.disconnect();
       } catch (error) {

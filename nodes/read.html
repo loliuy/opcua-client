@@ -60,6 +60,7 @@
       <li><b>Value only</b>：批量时按点表顺序输出值数组，单点时输出标量。</li>
       <li><b>Full metadata</b>：同时输出完整点表描述和客户端诊断，适合排障。</li>
     </ul>
+    <p>Int64/UInt64 超出 JavaScript 安全整数范围时以十进制字符串输出，避免累计量和计数器精度丢失。</p>
     <p>大点表会按照 Batch size 和服务器 OperationLimits 自动拆分为批量服务请求，不会逐点建立连接。</p>
   </section>
   <hr>
@@ -79,6 +80,7 @@
       <li><b>Value only</b>: A value array in point-list order for batch reads, or a scalar for one point.</li>
       <li><b>Full metadata</b>: Full point descriptors and client diagnostics for troubleshooting.</li>
     </ul>
+    <p>Int64/UInt64 values outside the JavaScript safe-integer range are emitted as decimal strings to preserve exact counters and totals.</p>
     <p>Large point lists are split according to Batch size and server OperationLimits. The node does not create one connection per point.</p>
   </section>
 </script>
