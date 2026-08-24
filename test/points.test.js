@@ -108,6 +108,24 @@ test('parses and coerces JSON and CSV write imports', () => {
   assert.equal(looksLikePointList('hello'), false);
 });
 
+test('validates integer write ranges and preserves 64-bit decimal precision', () => {
+  assert.equal(coerceWriteValue('127', 'SByte'), 127);
+  assert.equal(coerceWriteValue('4294967295', 'UInt32'), 4294967295);
+  assert.equal(coerceWriteValue('9223372036854775807', 'Int64'), '9223372036854775807');
+  assert.equal(coerceWriteValue('-9223372036854775808', 'Int64'), '-9223372036854775808');
+  assert.equal(coerceWriteValue('18446744073709551615', 'UInt64'), '18446744073709551615');
+  assert.equal(coerceWriteValue(9007199254740991, 'UInt64'), 9007199254740991);
+  assert.deepEqual(
+    coerceWriteValue(['9007199254740992', '18446744073709551615'], 'UInt64'),
+    ['9007199254740992', '18446744073709551615']
+  );
+  assert.throws(() => coerceWriteValue(9007199254740992, 'Int64'), /decimal string/);
+  assert.throws(() => coerceWriteValue('128', 'SByte'), /outside OPC UA range/);
+  assert.throws(() => coerceWriteValue('-1', 'UInt64'), /outside OPC UA range/);
+  assert.throws(() => coerceWriteValue('18446744073709551616', 'UInt64'), /outside OPC UA range/);
+  assert.throws(() => coerceWriteValue('1.5', 'Int32'), /Invalid Int32/);
+});
+
 test('streams CSV writes into compact deduplicated points', () => {
   const points = messageWritePoints({
     payload: [

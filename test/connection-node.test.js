@@ -225,3 +225,92 @@ test('explicit parallel Session setting suppresses the duplicate warning without
   await closeNode(first);
   await closeNode(second);
 });
+
+test('waits for dependent resource cleanup before disconnecting the shared client', async () => {
+  const harness = createHarness();
+  const events = [];
+  let releaseCleanup;
+  let cleanupStarted;
+  const cleanupStartedPromise = new Promise((resolve) => { cleanupStarted = resolve; });
+  const cleanupGate = new Promise((resolve) => { releaseCleanup = resolve; });
+  setAddonForTests({
+    connectAsync: async () => 91,
+    disconnectAsync: async () => { events.push('disconnect'); },
+  });
+  const node = new harness.Constructor({
+    endpoint: 'opc.tcp://wincc:4862',
+    securityMode: 'None',
+    securityPolicy: 'None',
+  });
+  await node.client.connect();
+  let cleanupRuns = 0;
+  const runCleanup = node.registerDependentCleanup(async () => {
+    cleanupRuns += 1;
+    events.push('cleanup-start');
+    cleanupStarted();
+    await cleanupGate;
+    events.push('cleanup-end');
+  });
+
+  const closing = closeNode(node);
+  await cleanupStartedPromise;
+  const concurrentCleanup = runCleanup();
+  assert.deepEqual(events, ['cleanup-start']);
+  releaseCleanup();
+  await Promise.all([closing, concurrentCleanup]);
+
+  assert.equal(cleanupRuns, 1);
+  assert.deepEqual(events, ['cleanup-start', 'cleanup-end', 'disconnect']);
+  await runCleanup();
+  assert.equal(cleanupRuns, 1);
+});
+
+test('reports consumer references and last use without automatic idle disconnect', async () => {
+  const harness = createHarness();
+  setAddonForTests({ disconnectAsync: async () => {} });
+  const node = new harness.Constructor({
+    endpoint: 'opc.tcp://wincc:4862',
+    securityMode: 'None',
+    securityPolicy: 'None',
+  });
+  const read = node.registerConsumer('read', { nodeId: 'read-1', name: 'Line read' });
+  const subscribe = node.registerConsumer('subscribe', { nodeId: 'sub-1' });
+
+  assert.deepEqual(node.getConnectionUsage(), {
+    consumerCount: 2,
+    consumerTypes: { read: 1, subscribe: 1 },
+    consumers: [
+      {
+        id: 'read-1', type: 'read', name: 'Line read',
+        registeredAt: node.getConnectionUsage().consumers[0].registeredAt,
+        lastUsedAt: null, operations: 0,
+      },
+      {
+        id: 'sub-1', type: 'subscribe', name: '',
+        registeredAt: node.getConnectionUsage().consumers[1].registeredAt,
+        lastUsedAt: null, operations: 0,
+      },
+    ],
+    lastUsedAt: null,
+    idleMs: null,
+    totalOperations: 0,
+    operations: {},
+    automaticIdleDisconnect: false,
+  });
+
+  read.markUsed('read');
+  node.markUsed('editor-browse');
+  const used = node.getConnectionUsage();
+  assert.equal(used.totalOperations, 2);
+  assert.deepEqual(used.operations, { read: 1, 'editor-browse': 1 });
+  assert.equal(used.consumers[0].operations, 1);
+  assert.match(used.lastUsedAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert(used.idleMs >= 0);
+
+  read.release();
+  read.release();
+  subscribe.release();
+  assert.equal(node.getConnectionUsage().consumerCount, 0);
+  assert.equal(node.getConnectionUsage().automaticIdleDisconnect, false);
+  await closeNode(node);
+});

@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -201,6 +203,94 @@ std::string BuiltinTypeName(const UA_NodeId& node_id) {
   }
 }
 
+constexpr UA_Int64 kJsSafeInteger = 9007199254740991LL;
+
+Napi::Value Int64Value(Napi::Env env, UA_Int64 value) {
+  if (value >= -kJsSafeInteger && value <= kJsSafeInteger) {
+    return Napi::Number::New(env, static_cast<double>(value));
+  }
+  return Napi::String::New(env, std::to_string(value));
+}
+
+Napi::Value UInt64Value(Napi::Env env, UA_UInt64 value) {
+  if (value <= static_cast<UA_UInt64>(kJsSafeInteger)) {
+    return Napi::Number::New(env, static_cast<double>(value));
+  }
+  return Napi::String::New(env, std::to_string(value));
+}
+
+bool InvalidInteger(Napi::Env env, const std::string& name,
+                    const std::string& detail) {
+  Napi::RangeError::New(env, "Invalid " + name + " value: " + detail)
+      .ThrowAsJavaScriptException();
+  return false;
+}
+
+bool ParseIntegerNumber(Napi::Env env, const Napi::Value& input,
+                        const std::string& name, double minimum,
+                        double maximum, double* output) {
+  if (!input.IsNumber() && !input.IsString()) {
+    return InvalidInteger(env, name, "expected an integer number");
+  }
+  if (input.IsString() && input.As<Napi::String>().Utf8Value().empty()) {
+    return InvalidInteger(env, name, "empty string");
+  }
+  const double value = input.ToNumber().DoubleValue();
+  if (!std::isfinite(value) || std::trunc(value) != value ||
+      value < minimum || value > maximum) {
+    return InvalidInteger(env, name, input.ToString().Utf8Value());
+  }
+  *output = value;
+  return true;
+}
+
+bool ParseInt64(Napi::Env env, const Napi::Value& input, UA_Int64* output) {
+  if (input.IsBigInt()) {
+    bool lossless = false;
+    *output = input.As<Napi::BigInt>().Int64Value(&lossless);
+    return lossless || InvalidInteger(env, "Int64", "out of range");
+  }
+  if (input.IsString()) {
+    const std::string text = input.As<Napi::String>().Utf8Value();
+    const auto result = std::from_chars(
+        text.data(), text.data() + text.size(), *output, 10);
+    if (!text.empty() && result.ec == std::errc() &&
+        result.ptr == text.data() + text.size()) return true;
+    return InvalidInteger(env, "Int64", text);
+  }
+  double value = 0;
+  if (!ParseIntegerNumber(env, input, "Int64",
+                          -static_cast<double>(kJsSafeInteger),
+                          static_cast<double>(kJsSafeInteger), &value)) {
+    return false;
+  }
+  *output = static_cast<UA_Int64>(value);
+  return true;
+}
+
+bool ParseUInt64(Napi::Env env, const Napi::Value& input, UA_UInt64* output) {
+  if (input.IsBigInt()) {
+    bool lossless = false;
+    *output = input.As<Napi::BigInt>().Uint64Value(&lossless);
+    return lossless || InvalidInteger(env, "UInt64", "out of range");
+  }
+  if (input.IsString()) {
+    const std::string text = input.As<Napi::String>().Utf8Value();
+    const auto result = std::from_chars(
+        text.data(), text.data() + text.size(), *output, 10);
+    if (!text.empty() && result.ec == std::errc() &&
+        result.ptr == text.data() + text.size()) return true;
+    return InvalidInteger(env, "UInt64", text);
+  }
+  double value = 0;
+  if (!ParseIntegerNumber(env, input, "UInt64", 0,
+                          static_cast<double>(kJsSafeInteger), &value)) {
+    return false;
+  }
+  *output = static_cast<UA_UInt64>(value);
+  return true;
+}
+
 Napi::Value VariantValue(Napi::Env env, const UA_Variant* variant) {
   if (!variant || !variant->type || !variant->data) return env.Null();
   const UA_DataType* type = variant->type;
@@ -213,8 +303,8 @@ Napi::Value VariantValue(Napi::Env env, const UA_Variant* variant) {
     if (type == &UA_TYPES[UA_TYPES_UINT16]) return Napi::Number::New(env, *static_cast<const UA_UInt16*>(data));
     if (type == &UA_TYPES[UA_TYPES_INT32]) return Napi::Number::New(env, *static_cast<const UA_Int32*>(data));
     if (type == &UA_TYPES[UA_TYPES_UINT32]) return Napi::Number::New(env, *static_cast<const UA_UInt32*>(data));
-    if (type == &UA_TYPES[UA_TYPES_INT64]) return Napi::Number::New(env, static_cast<double>(*static_cast<const UA_Int64*>(data)));
-    if (type == &UA_TYPES[UA_TYPES_UINT64]) return Napi::Number::New(env, static_cast<double>(*static_cast<const UA_UInt64*>(data)));
+    if (type == &UA_TYPES[UA_TYPES_INT64]) return Int64Value(env, *static_cast<const UA_Int64*>(data));
+    if (type == &UA_TYPES[UA_TYPES_UINT64]) return UInt64Value(env, *static_cast<const UA_UInt64*>(data));
     if (type == &UA_TYPES[UA_TYPES_FLOAT]) return Napi::Number::New(env, *static_cast<const UA_Float*>(data));
     if (type == &UA_TYPES[UA_TYPES_DOUBLE]) return Napi::Number::New(env, *static_cast<const UA_Double*>(data));
     if (type == &UA_TYPES[UA_TYPES_STRING]) return Napi::String::New(env, UaString(*static_cast<const UA_String*>(data)));
@@ -260,14 +350,14 @@ bool JsScalarToVariant(Napi::Env env, const Napi::Value& input, const std::strin
     UA_Boolean value = input.ToBoolean();
     return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type));
   }
-  if (name == "SByte") { UA_SByte value = static_cast<UA_SByte>(input.ToNumber().Int32Value()); return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type)); }
-  if (name == "Byte") { UA_Byte value = static_cast<UA_Byte>(input.ToNumber().Uint32Value()); return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type)); }
-  if (name == "Int16") { UA_Int16 value = static_cast<UA_Int16>(input.ToNumber().Int32Value()); return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type)); }
-  if (name == "UInt16") { UA_UInt16 value = static_cast<UA_UInt16>(input.ToNumber().Uint32Value()); return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type)); }
-  if (name == "Int32") { UA_Int32 value = input.ToNumber().Int32Value(); return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type)); }
-  if (name == "UInt32") { UA_UInt32 value = input.ToNumber().Uint32Value(); return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type)); }
-  if (name == "Int64") { bool lossless = false; UA_Int64 value = input.IsBigInt() ? input.As<Napi::BigInt>().Int64Value(&lossless) : static_cast<UA_Int64>(input.ToNumber().Int64Value()); return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type)); }
-  if (name == "UInt64") { bool lossless = false; UA_UInt64 value = input.IsBigInt() ? input.As<Napi::BigInt>().Uint64Value(&lossless) : static_cast<UA_UInt64>(input.ToNumber().Int64Value()); return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type)); }
+  if (name == "SByte") { double parsed; if (!ParseIntegerNumber(env, input, name, -128, 127, &parsed)) return false; UA_SByte value = static_cast<UA_SByte>(parsed); return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type)); }
+  if (name == "Byte") { double parsed; if (!ParseIntegerNumber(env, input, name, 0, 255, &parsed)) return false; UA_Byte value = static_cast<UA_Byte>(parsed); return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type)); }
+  if (name == "Int16") { double parsed; if (!ParseIntegerNumber(env, input, name, -32768, 32767, &parsed)) return false; UA_Int16 value = static_cast<UA_Int16>(parsed); return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type)); }
+  if (name == "UInt16") { double parsed; if (!ParseIntegerNumber(env, input, name, 0, 65535, &parsed)) return false; UA_UInt16 value = static_cast<UA_UInt16>(parsed); return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type)); }
+  if (name == "Int32") { double parsed; if (!ParseIntegerNumber(env, input, name, -2147483648.0, 2147483647.0, &parsed)) return false; UA_Int32 value = static_cast<UA_Int32>(parsed); return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type)); }
+  if (name == "UInt32") { double parsed; if (!ParseIntegerNumber(env, input, name, 0, 4294967295.0, &parsed)) return false; UA_UInt32 value = static_cast<UA_UInt32>(parsed); return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type)); }
+  if (name == "Int64") { UA_Int64 value; if (!ParseInt64(env, input, &value)) return false; return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type)); }
+  if (name == "UInt64") { UA_UInt64 value; if (!ParseUInt64(env, input, &value)) return false; return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type)); }
   if (name == "Float") { UA_Float value = input.ToNumber().FloatValue(); return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type)); }
   if (name == "Double") { UA_Double value = input.ToNumber().DoubleValue(); return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type)); }
   if (name == "String") { std::string text = input.ToString().Utf8Value(); UA_String value = UA_STRING(const_cast<char*>(text.c_str())); return UA_StatusCode_isGood(UA_Variant_setScalarCopy(output, &value, type)); }
@@ -1481,6 +1571,8 @@ struct BrowseOptions {
   bool variables_only = true;
   uint32_t max_depth = 10;
   uint32_t max_nodes = 10000;
+  uint32_t browse_batch_size = 100;
+  uint32_t references_per_node = 1000;
   uint32_t attribute_batch_size = 200;
   std::set<uint16_t> namespaces;
 };
@@ -1512,16 +1604,51 @@ class BrowseWorker : public ClientCommandWorker {
       item.Set("userAccessLevel", point.user_access_level); item.Set("minimumSamplingInterval", point.minimum_sampling_interval);
       output.Set(index, item);
     }
+    output.Set("truncated", truncated_);
+    if (!truncation_reason_.empty()) output.Set("truncationReason", truncation_reason_);
+    output.Set("serviceCalls", Napi::Number::New(
+        Env(), static_cast<double>(service_calls_)));
+    output.Set("browseBatchSize", browse_batch_size_);
+    output.Set("releasedContinuationPoints", Napi::Number::New(
+        Env(), static_cast<double>(released_continuation_points_)));
+    Napi::Array failures = Napi::Array::New(Env(), browse_failures_.size());
+    for (size_t index = 0; index < browse_failures_.size(); ++index) {
+      Napi::Object failure = Napi::Object::New(Env());
+      failure.Set("nodeId", browse_failures_[index].first);
+      failure.Set("statusCode", browse_failures_[index].second);
+      failures.Set(index, failure);
+    }
+    output.Set("browseFailures", failures);
     deferred_.Resolve(output);
   }
  private:
   struct QueueItem { std::string node_id; std::string path; uint32_t depth; };
+  struct PendingContinuation {
+    QueueItem parent;
+    std::vector<UA_Byte> token;
+  };
 
   bool NamespaceAllowed(uint16_t value) const { return options_.namespaces.empty() || options_.namespaces.count(value) > 0; }
 
+  void MarkTruncated(const std::string& reason) {
+    truncated_ = true;
+    if (truncation_reason_.empty() || truncation_reason_ == "maxDepth") {
+      truncation_reason_ = reason;
+    }
+  }
+
+  void MarkDepthLimited() {
+    depth_limited_ = true;
+    if (truncation_reason_.empty()) truncation_reason_ = "maxDepth";
+  }
+
   void ProcessBrowseResult(const QueueItem& parent, const UA_BrowseResult& result,
                            std::deque<QueueItem>* queue, std::set<std::string>* visited) {
-    for (size_t index = 0; index < result.referencesSize && points_.size() < options_.max_nodes; ++index) {
+    for (size_t index = 0; index < result.referencesSize; ++index) {
+      if (points_.size() >= options_.max_nodes) {
+        MarkTruncated("maxNodes");
+        return;
+      }
       const UA_ReferenceDescription& reference = result.references[index];
       if (reference.nodeId.serverIndex != 0 || reference.nodeId.namespaceUri.length != 0) continue;
       const UA_NodeId& node_id = reference.nodeId.nodeId;
@@ -1539,58 +1666,206 @@ class BrowseWorker : public ClientCommandWorker {
         point.node_class = reference.nodeClass; point.type_definition = NodeIdString(reference.typeDefinition.nodeId);
         points_.push_back(std::move(point));
       }
-      if (options_.recursive && parent.depth < options_.max_depth && visited->insert(node_id_text).second) {
-        queue->push_back({node_id_text, path, parent.depth + 1});
+      if (options_.recursive) {
+        if (parent.depth < options_.max_depth) {
+          if (visited->insert(node_id_text).second) {
+            queue->push_back({node_id_text, path, parent.depth + 1});
+          }
+        } else if (reference.nodeClass == UA_NODECLASS_OBJECT) {
+          MarkDepthLimited();
+        }
       }
     }
+  }
+
+  static PendingContinuation Continuation(
+      const QueueItem& parent, const UA_ByteString& point) {
+    PendingContinuation output{parent, {}};
+    if (point.length && point.data) {
+      output.token.assign(point.data, point.data + point.length);
+    }
+    return output;
+  }
+
+  bool FillContinuationPoints(
+      const std::vector<PendingContinuation>& pending, size_t start, size_t count,
+      UA_BrowseNextRequest* request) {
+    request->continuationPointsSize = count;
+    request->continuationPoints = static_cast<UA_ByteString*>(
+        UA_Array_new(count, &UA_TYPES[UA_TYPES_BYTESTRING]));
+    if (!request->continuationPoints) return false;
+    for (size_t index = 0; index < count; ++index) {
+      const auto& token = pending[start + index].token;
+      UA_ByteString source;
+      source.length = token.size();
+      source.data = const_cast<UA_Byte*>(token.data());
+      if (UA_ByteString_copy(&source, &request->continuationPoints[index]) !=
+          UA_STATUSCODE_GOOD) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void ReleaseContinuations(const std::vector<PendingContinuation>& pending) {
+    for (size_t start = 0; start < pending.size(); start += browse_batch_size_) {
+      const size_t count = std::min<size_t>(
+          browse_batch_size_, pending.size() - start);
+      UA_BrowseNextRequest request;
+      UA_BrowseNextRequest_init(&request);
+      request.releaseContinuationPoints = true;
+      if (!FillContinuationPoints(pending, start, count, &request)) {
+        UA_BrowseNextRequest_clear(&request);
+        continue;
+      }
+      UA_BrowseNextResponse response =
+          UA_Client_Service_browseNext(context_->client, request);
+      ++service_calls_;
+      UA_BrowseNextRequest_clear(&request);
+      UA_BrowseNextResponse_clear(&response);
+      released_continuation_points_ += count;
+    }
+  }
+
+  bool BrowseContinuations(
+      std::vector<PendingContinuation>* pending, std::deque<QueueItem>* queue,
+      std::set<std::string>* visited) {
+    while (!pending->empty()) {
+      std::vector<PendingContinuation> next_pending;
+      for (size_t start = 0; start < pending->size(); start += browse_batch_size_) {
+        const size_t count = std::min<size_t>(
+            browse_batch_size_, pending->size() - start);
+        UA_BrowseNextRequest request;
+        UA_BrowseNextRequest_init(&request);
+        if (!FillContinuationPoints(*pending, start, count, &request)) {
+          UA_BrowseNextRequest_clear(&request);
+          ReleaseContinuations(*pending);
+          SetError("Failed to allocate BrowseNext continuation points");
+          return false;
+        }
+        UA_BrowseNextResponse response =
+            UA_Client_Service_browseNext(context_->client, request);
+        ++service_calls_;
+        UA_BrowseNextRequest_clear(&request);
+        if (!UA_StatusCode_isGood(response.responseHeader.serviceResult)) {
+          const std::string status = StatusName(
+              response.responseHeader.serviceResult);
+          UA_BrowseNextResponse_clear(&response);
+          ReleaseContinuations(*pending);
+          SetError("BrowseNext failed: " + status);
+          return false;
+        }
+        for (size_t index = 0; index < count; ++index) {
+          const auto& parent = (*pending)[start + index].parent;
+          if (index < response.resultsSize) {
+            const UA_BrowseResult& result = response.results[index];
+            if (UA_StatusCode_isGood(result.statusCode) && !truncated_) {
+              ProcessBrowseResult(parent, result, queue, visited);
+            } else if (!UA_StatusCode_isGood(result.statusCode)) {
+              browse_failures_.push_back(
+                  {parent.node_id, StatusName(result.statusCode)});
+            }
+            if (result.continuationPoint.length) {
+              next_pending.push_back(
+                  Continuation(parent, result.continuationPoint));
+            }
+          } else {
+            browse_failures_.push_back(
+                {parent.node_id, "BadUnexpectedError"});
+          }
+        }
+        UA_BrowseNextResponse_clear(&response);
+      }
+      if (truncated_) {
+        ReleaseContinuations(next_pending);
+        return true;
+      }
+      *pending = std::move(next_pending);
+    }
+    return true;
   }
 
   bool BrowseTree() {
     std::deque<QueueItem> queue{{options_.root_node_id, "", 0}};
     std::set<std::string> visited{options_.root_node_id};
-    while (!queue.empty() && points_.size() < options_.max_nodes) {
-      QueueItem current = std::move(queue.front()); queue.pop_front();
-      UA_BrowseRequest request; UA_BrowseRequest_init(&request);
-      request.requestedMaxReferencesPerNode = 1000;
-      request.nodesToBrowseSize = 1;
-      request.nodesToBrowse = static_cast<UA_BrowseDescription*>(UA_Array_new(1, &UA_TYPES[UA_TYPES_BROWSEDESCRIPTION]));
-      if (!request.nodesToBrowse || !CopyCachedNodeId(context_.get(), current.node_id, &request.nodesToBrowse[0].nodeId)) {
-        UA_BrowseRequest_clear(&request); SetError("Invalid browse NodeId: " + current.node_id); return false;
+    browse_batch_size_ = std::max<uint32_t>(1, options_.browse_batch_size);
+    const uint32_t server_limit =
+        context_->operation_limits.max_nodes_per_browse.load();
+    if (server_limit > 0) {
+      browse_batch_size_ = std::min(browse_batch_size_, server_limit);
+    }
+    while (!queue.empty() && !truncated_) {
+      std::vector<QueueItem> batch;
+      batch.reserve(browse_batch_size_);
+      while (!queue.empty() && batch.size() < browse_batch_size_) {
+        batch.push_back(std::move(queue.front()));
+        queue.pop_front();
       }
-      auto& description = request.nodesToBrowse[0];
-      description.browseDirection = UA_BROWSEDIRECTION_FORWARD;
-      description.referenceTypeId = UA_NODEID_NUMERIC(0, UA_NS0ID_HIERARCHICALREFERENCES);
-      description.includeSubtypes = true;
-      description.nodeClassMask = UA_NODECLASS_OBJECT | UA_NODECLASS_VARIABLE;
-      description.resultMask = UA_BROWSERESULTMASK_ALL;
+      UA_BrowseRequest request; UA_BrowseRequest_init(&request);
+      request.requestedMaxReferencesPerNode = options_.references_per_node;
+      request.nodesToBrowseSize = batch.size();
+      request.nodesToBrowse = static_cast<UA_BrowseDescription*>(
+          UA_Array_new(batch.size(), &UA_TYPES[UA_TYPES_BROWSEDESCRIPTION]));
+      if (!request.nodesToBrowse) {
+        SetError("Failed to allocate Browse request");
+        return false;
+      }
+      for (size_t index = 0; index < batch.size(); ++index) {
+        if (!CopyCachedNodeId(context_.get(), batch[index].node_id,
+                              &request.nodesToBrowse[index].nodeId)) {
+          const std::string invalid = batch[index].node_id;
+          UA_BrowseRequest_clear(&request);
+          SetError("Invalid browse NodeId: " + invalid);
+          return false;
+        }
+        auto& description = request.nodesToBrowse[index];
+        description.browseDirection = UA_BROWSEDIRECTION_FORWARD;
+        description.referenceTypeId =
+            UA_NODEID_NUMERIC(0, UA_NS0ID_HIERARCHICALREFERENCES);
+        description.includeSubtypes = true;
+        description.nodeClassMask = UA_NODECLASS_OBJECT | UA_NODECLASS_VARIABLE;
+        description.resultMask = UA_BROWSERESULTMASK_ALL;
+      }
       UA_BrowseResponse response = UA_Client_Service_browse(context_->client, request);
+      ++service_calls_;
       UA_BrowseRequest_clear(&request);
       if (!UA_StatusCode_isGood(response.responseHeader.serviceResult)) {
         UA_BrowseResponse_clear(&response); SetError("Browse failed: " + StatusName(response.responseHeader.serviceResult)); return false;
       }
-      if (response.resultsSize) {
-        ProcessBrowseResult(current, response.results[0], &queue, &visited);
-        UA_ByteString continuation = UA_BYTESTRING_NULL;
-        UA_ByteString_copy(&response.results[0].continuationPoint, &continuation);
-        while (continuation.length && points_.size() < options_.max_nodes) {
-          UA_BrowseNextRequest next; UA_BrowseNextRequest_init(&next);
-          next.continuationPointsSize = 1;
-          next.continuationPoints = static_cast<UA_ByteString*>(UA_Array_new(1, &UA_TYPES[UA_TYPES_BYTESTRING]));
-          UA_ByteString_copy(&continuation, &next.continuationPoints[0]);
-          UA_ByteString_clear(&continuation);
-          UA_BrowseNextResponse next_response = UA_Client_Service_browseNext(context_->client, next);
-          UA_BrowseNextRequest_clear(&next);
-          if (!UA_StatusCode_isGood(next_response.responseHeader.serviceResult) || !next_response.resultsSize) {
-            UA_BrowseNextResponse_clear(&next_response); break;
+      std::vector<PendingContinuation> pending;
+      for (size_t index = 0; index < batch.size(); ++index) {
+        if (index < response.resultsSize) {
+          const UA_BrowseResult& result = response.results[index];
+          if (UA_StatusCode_isGood(result.statusCode) && !truncated_) {
+            ProcessBrowseResult(batch[index], result, &queue, &visited);
+          } else if (!UA_StatusCode_isGood(result.statusCode)) {
+            browse_failures_.push_back(
+                {batch[index].node_id, StatusName(result.statusCode)});
           }
-          ProcessBrowseResult(current, next_response.results[0], &queue, &visited);
-          UA_ByteString_copy(&next_response.results[0].continuationPoint, &continuation);
-          UA_BrowseNextResponse_clear(&next_response);
+          if (result.continuationPoint.length) {
+            pending.push_back(
+                Continuation(batch[index], result.continuationPoint));
+          }
+        } else {
+          browse_failures_.push_back(
+              {batch[index].node_id, "BadUnexpectedError"});
         }
-        UA_ByteString_clear(&continuation);
       }
       UA_BrowseResponse_clear(&response);
+      if (points_.size() >= options_.max_nodes &&
+          (!pending.empty() || !queue.empty())) {
+        MarkTruncated("maxNodes");
+      }
+      if (truncated_) {
+        ReleaseContinuations(pending);
+        break;
+      }
+      if (!BrowseContinuations(&pending, &queue, &visited)) return false;
+      if (points_.size() >= options_.max_nodes && !queue.empty()) {
+        MarkTruncated("maxNodes");
+      }
     }
+    if (depth_limited_) truncated_ = true;
     return true;
   }
 
@@ -1647,6 +1922,13 @@ class BrowseWorker : public ClientCommandWorker {
 
   BrowseOptions options_;
   std::vector<BrowsePoint> points_;
+  uint32_t browse_batch_size_ = 1;
+  uint64_t service_calls_ = 0;
+  uint64_t released_continuation_points_ = 0;
+  bool truncated_ = false;
+  bool depth_limited_ = false;
+  std::string truncation_reason_;
+  std::vector<std::pair<std::string, std::string>> browse_failures_;
 };
 
 class CreateSubscriptionWorker : public ClientCommandWorker {
@@ -1673,6 +1955,9 @@ class CreateSubscriptionWorker : public ClientCommandWorker {
     if (!context_->client) { SetError("Client disconnected"); return; }
     UA_CreateSubscriptionResponse response = UA_Client_Subscriptions_create(context_->client, request, nullptr, nullptr, nullptr);
     status_ = response.responseHeader.serviceResult; subscription_id_ = response.subscriptionId;
+    revised_publishing_interval_ = response.revisedPublishingInterval;
+    revised_lifetime_ = response.revisedLifetimeCount;
+    revised_keepalive_ = response.revisedMaxKeepAliveCount;
     UA_CreateSubscriptionResponse_clear(&response);
     if (!UA_StatusCode_isGood(status_)) { SetError("Create subscription failed: " + StatusName(status_)); return; }
     auto subscription = std::make_unique<SubscriptionContext>();
@@ -1685,17 +1970,18 @@ class CreateSubscriptionWorker : public ClientCommandWorker {
     subscription->notifications->overflow_policy = overflow_policy_;
     context_->subscriptions[subscription_id_] = std::move(subscription); transferred_ = true;
   }
-  void OnOK() override { Napi::Object result = Napi::Object::New(Env()); result.Set("subscriptionId", subscription_id_); result.Set("statusCode", StatusName(status_)); deferred_.Resolve(result); }
+  void OnOK() override { Napi::Object result = Napi::Object::New(Env()); result.Set("subscriptionId", subscription_id_); result.Set("statusCode", StatusName(status_)); result.Set("revisedPublishingInterval", revised_publishing_interval_); result.Set("revisedLifetimeCount", revised_lifetime_); result.Set("revisedMaxKeepAliveCount", revised_keepalive_); deferred_.Resolve(result); }
   void OnError(const Napi::Error& error) override { if (!transferred_) callback_.Release(); PromiseWorker::OnError(error); }
  private:
   Napi::ThreadSafeFunction callback_; bool transferred_ = false;
   double publishing_interval_; uint32_t lifetime_; uint32_t keepalive_; uint32_t max_notifications_;
   uint32_t queue_size_; uint32_t callback_batch_size_; std::string queue_mode_; std::string overflow_policy_;
   uint32_t subscription_id_ = 0; UA_StatusCode status_ = UA_STATUSCODE_GOOD;
+  double revised_publishing_interval_ = 0; uint32_t revised_lifetime_ = 0; uint32_t revised_keepalive_ = 0;
 };
 
 struct MonitorInput { std::string node_id; double sampling_interval; uint32_t queue_size; bool discard_oldest; std::string deadband_type; double deadband_value; };
-struct MonitorResult { std::string node_id; uint32_t monitored_item_id = 0; uint32_t client_handle = 0; UA_StatusCode status = UA_STATUSCODE_BADUNEXPECTEDERROR; };
+struct MonitorResult { std::string node_id; uint32_t monitored_item_id = 0; uint32_t client_handle = 0; double revised_sampling_interval = 0; uint32_t revised_queue_size = 0; UA_StatusCode status = UA_STATUSCODE_BADUNEXPECTEDERROR; };
 
 class AddMonitoredWorker : public ClientCommandWorker {
  public:
@@ -1750,14 +2036,14 @@ class AddMonitoredWorker : public ClientCommandWorker {
     for (size_t index = 0; index < inputs_.size(); ++index) {
       MonitorResult result; result.node_id = inputs_[index].node_id; result.client_handle = contexts[index]->client_handle;
       if (index < response.resultsSize) {
-        result.status = response.results[index].statusCode; result.monitored_item_id = response.results[index].monitoredItemId;
+        result.status = response.results[index].statusCode; result.monitored_item_id = response.results[index].monitoredItemId; result.revised_sampling_interval = response.results[index].revisedSamplingInterval; result.revised_queue_size = response.results[index].revisedQueueSize;
         if (UA_StatusCode_isGood(result.status)) { contexts[index]->monitored_item_id = result.monitored_item_id; auto* monitored_context = contexts[index].get(); subscription->monitored_by_client_handle[monitored_context->client_handle] = monitored_context; subscription->monitored[result.monitored_item_id] = std::move(contexts[index]); }
       }
       results_.push_back(result);
     }
     UA_CreateMonitoredItemsResponse_clear(&response);
   }
-  void OnOK() override { Napi::Array output = Napi::Array::New(Env(), results_.size()); for (size_t index = 0; index < results_.size(); ++index) { Napi::Object item = Napi::Object::New(Env()); item.Set("nodeId", results_[index].node_id); item.Set("monitoredItemId", results_[index].monitored_item_id); item.Set("clientHandle", results_[index].client_handle); item.Set("statusCode", StatusName(results_[index].status)); output.Set(index, item); } deferred_.Resolve(output); }
+  void OnOK() override { Napi::Array output = Napi::Array::New(Env(), results_.size()); for (size_t index = 0; index < results_.size(); ++index) { Napi::Object item = Napi::Object::New(Env()); item.Set("nodeId", results_[index].node_id); item.Set("monitoredItemId", results_[index].monitored_item_id); item.Set("clientHandle", results_[index].client_handle); item.Set("revisedSamplingInterval", results_[index].revised_sampling_interval); item.Set("revisedQueueSize", results_[index].revised_queue_size); item.Set("statusCode", StatusName(results_[index].status)); output.Set(index, item); } deferred_.Resolve(output); }
  private:
   uint32_t subscription_id_; std::vector<MonitorInput> inputs_; std::vector<MonitorResult> results_;
   UA_TimestampsToReturn timestamps_to_return_;
@@ -1956,7 +2242,7 @@ Napi::Value WriteManyAsync(const Napi::CallbackInfo& info) {
 
 Napi::Value BrowseAsync(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env(); auto context = RequireClient(env, info[0]); if (!context || !info[1].IsObject()) return env.Undefined(); Napi::Object object = info[1].As<Napi::Object>(); BrowseOptions options;
-  options.root_node_id = GetString(object, "rootNodeId", "ns=0;i=85"); options.recursive = GetBool(object, "recursive", true); options.variables_only = GetBool(object, "variablesOnly", true); options.max_depth = GetUInt(object, "maxDepth", 10); options.max_nodes = GetUInt(object, "maxNodes", 10000); options.attribute_batch_size = GetUInt(object, "attributeBatchSize", 200);
+  options.root_node_id = GetString(object, "rootNodeId", "ns=0;i=85"); options.recursive = GetBool(object, "recursive", true); options.variables_only = GetBool(object, "variablesOnly", true); options.max_depth = GetUInt(object, "maxDepth", 10); options.max_nodes = GetUInt(object, "maxNodes", 10000); options.browse_batch_size = GetUInt(object, "browseBatchSize", 100); options.references_per_node = GetUInt(object, "referencesPerNode", 1000); options.attribute_batch_size = GetUInt(object, "attributeBatchSize", 200);
   if (object.Has("namespaceIndexes") && object.Get("namespaceIndexes").IsArray()) { Napi::Array values = object.Get("namespaceIndexes").As<Napi::Array>(); for (uint32_t index = 0; index < values.Length(); ++index) options.namespaces.insert(static_cast<uint16_t>(values.Get(index).ToNumber().Uint32Value())); }
   auto deferred = Napi::Promise::Deferred::New(env); (new BrowseWorker(deferred, context, std::move(options)))->Queue(); return deferred.Promise();
 }

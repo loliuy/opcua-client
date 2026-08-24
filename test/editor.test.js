@@ -71,6 +71,10 @@ test('Browse editor contains a tri-state selectable node tree', () => {
   assert.match(html, /'aria-checked', indeterminate \? 'mixed'/);
   assert.match(html, /setSubtree\(node, this\.checked\)/);
   assert.match(html, /selectedNodes: \{ value: \[\] \}/);
+  assert.match(html, /id="node-input-browseBatchSize"/);
+  assert.match(html, /browseBatchSize: \{ value: 100/);
+  assert.match(html, /referencesPerNode: \{ value: 1000/);
+  assert.match(html, /msg\.opcua\.browse\.truncated/);
 });
 
 test('node editors compile and keep advanced settings collapsed by default', () => {
@@ -97,7 +101,10 @@ test('Subscribe editor exposes automatic sharding and dual-threshold batching', 
   assert.match(html, /resultDetail: \{ value: 'compact'/);
   assert.match(html, /queueSize: \{ value: 1/);
   assert.match(html, /queueMode: \{ value: 'latest'/);
-  assert.match(html, /keeps the latest pending value per point/);
+  assert.match(html, /id="node-input-pointList"/);
+  assert.match(html, /id="node-input-importPointList"/);
+  assert.match(html, /start automatically after deploy/);
+  assert.match(html, /without rebuilding server subscriptions/);
   assert.match(html, /msg\.opcua\.identifiers/);
   assert.match(html, /one or more OPC UA subscriptions/);
 });

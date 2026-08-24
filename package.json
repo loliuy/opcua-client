@@ -1,6 +1,6 @@
 {
   "name": "@tier0/opcua-client",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "High-scale OPC UA client nodes for Node-RED powered by open62541",
   "license": "Apache-2.0",
   "repository": {
@@ -38,7 +38,8 @@
     "test:stress": "node test/stress.js",
     "test:nodered": "node test/nodered.integration.js",
     "test:nodered:reconnect": "OPCUA_NODERED_RECONNECT=1 node test/nodered.integration.js",
-    "prepack": "node scripts/verify-offline-package.js"
+    "test:release": "npm test && npm run test:native && npm run test:offline-runtime && npm run test:nodered",
+    "prepack": "npm test && node scripts/verify-offline-package.js"
   },
   "keywords": [
     "node-red",

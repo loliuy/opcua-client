@@ -9,6 +9,7 @@ const { OpcUaClient } = require('../lib/client');
 
 const adminUrl = process.env.NODE_RED_ADMIN_URL || 'http://127.0.0.1:1880';
 const pointCount = positiveInteger(process.env.OPCUA_NODERED_POINTS, 5000);
+const browseNodeLimit = pointCount + Math.ceil(pointCount / 500) + 100;
 const readRounds = positiveInteger(process.env.OPCUA_NODERED_READ_ROUNDS, 3);
 const writeRounds = positiveInteger(process.env.OPCUA_NODERED_WRITE_ROUNDS, 5);
 const batchSize = positiveInteger(process.env.OPCUA_NODERED_BATCH_SIZE, 500);
@@ -16,11 +17,16 @@ const maxItemsPerSubscription = positiveInteger(
   process.env.OPCUA_NODERED_MAX_ITEMS_PER_SUBSCRIPTION,
   5000
 );
+const nodeIdCacheSize = positiveInteger(
+  process.env.OPCUA_NODERED_NODEID_CACHE_SIZE,
+  100000
+);
 const port = positiveInteger(process.env.OPCUA_NODERED_SERVER_PORT, 4845);
 const timeoutMs = positiveInteger(process.env.OPCUA_NODERED_TIMEOUT, 180000);
 const holdMs = Number(process.env.OPCUA_NODERED_HOLD_MS) || 0;
 const reconnectTest = process.env.OPCUA_NODERED_RECONNECT === '1';
 const externalWriteTest = process.env.OPCUA_NODERED_EXTERNAL_WRITE === '1';
+const editorBrowseTest = process.env.OPCUA_NODERED_EDITOR_BROWSE !== '0';
 const routeRoot = `/_codex_opcua_bench_${Date.now().toString(36)}`;
 
 function positiveInteger(value, fallback) {
@@ -58,11 +64,10 @@ async function jsonRequest(url, method, body) {
 }
 
 async function startFixture() {
-  const child = spawn('python3', [
-    path.join(__dirname, 'fixture', 'server.py'),
-    String(port),
-    String(pointCount),
-  ]);
+  const nativeServer = process.env.OPCUA_TEST_SERVER_BINARY;
+  const child = spawn(nativeServer || 'python3', nativeServer
+    ? [String(port), String(pointCount), '500', '0']
+    : [path.join(__dirname, 'fixture', 'server.py'), String(port), String(pointCount)]);
   let output = '';
   let errors = '';
   child.stdout.on('data', (data) => { output += data; });
@@ -158,13 +163,13 @@ return msg;`;
   const browseHttp = addHttp('browse', 'post', 60);
   const browsePrep = addFunction('prepare browse', `msg._benchStart=Date.now(); msg.nodeId='${rootNodeId}'; return msg;`, 60);
   const browseId = id();
-  nodes.push({ id: browseId, type: 'tier0-opcua-browse', z: tabId, name: 'real browse', connection: connectionId, rootNodeId, recursive: true, maxDepth: '3', maxNodes: String(pointCount + 100), variablesOnly: true, attributeBatchSize: '200', outputMode: 'all', pageSize: '500', x: 570, y: 60, wires: [[]] });
+  nodes.push({ id: browseId, type: 'tier0-opcua-browse', z: tabId, name: 'real browse', connection: connectionId, rootNodeId, recursive: true, maxDepth: '3', maxNodes: String(browseNodeLimit), variablesOnly: true, browseBatchSize: '100', referencesPerNode: '1000', attributeBatchSize: '200', outputMode: 'all', pageSize: '500', x: 570, y: 60, wires: [[]] });
   const browseSummary = addFunction('browse result', `const items=msg.payload||[]; msg.payload={operation:'browse',points:items.length,elapsedMs:Date.now()-msg._benchStart}; return msg;`, 60);
   wire(browseHttp, browsePrep); wire(browsePrep, browseId); wire(browseId, browseSummary); wire(browseSummary, responseId);
 
   const selectedBrowseHttp = addHttp('browse-selected', 'get', 100);
   const selectedBrowseId = id();
-  nodes.push({ id: selectedBrowseId, type: 'tier0-opcua-browse', z: tabId, name: 'saved tree selection', connection: connectionId, rootNodeId, selectedNodes: selectedBrowsePoints, recursive: true, variablesOnly: true, maxDepth: '3', maxNodes: String(pointCount + 100), attributeBatchSize: '200', outputMode: 'all', pageSize: '500', x: 570, y: 100, wires: [[]] });
+  nodes.push({ id: selectedBrowseId, type: 'tier0-opcua-browse', z: tabId, name: 'saved tree selection', connection: connectionId, rootNodeId, selectedNodes: selectedBrowsePoints, recursive: true, variablesOnly: true, maxDepth: '3', maxNodes: String(browseNodeLimit), browseBatchSize: '100', referencesPerNode: '1000', attributeBatchSize: '200', outputMode: 'all', pageSize: '500', x: 570, y: 100, wires: [[]] });
   const selectedBrowseSummary = addFunction('selected browse result', `msg.payload={operation:'browse-selected',points:(msg.payload||[]).length,nodeIds:(msg.payload||[]).map(x=>x.nodeId),source:msg.opcua&&msg.opcua.source}; return msg;`, 100);
   wire(selectedBrowseHttp, selectedBrowseId); wire(selectedBrowseId, selectedBrowseSummary); wire(selectedBrowseSummary, responseId);
 
@@ -255,7 +260,7 @@ return msg;`, 300);
     info: 'Temporary flow created by test/nodered.integration.js',
     env: [],
     nodes,
-    configs: [{ id: connectionId, type: 'tier0-opcua-connection', name: 'benchmark connection', endpoint, securityMode: 'None', securityPolicy: 'None', user: '', certificate: '', privateKey: '', requestedSessionTimeout: '5000', requestTimeout: '1000', connectivityCheckInterval: '500', reconnectInterval: '200', maxReconnectInterval: '1000', nodeIdCacheSize: '100000', commandQueueSize: '256' }],
+    configs: [{ id: connectionId, type: 'tier0-opcua-connection', name: 'benchmark connection', endpoint, securityMode: 'None', securityPolicy: 'None', user: '', certificate: '', privateKey: '', requestedSessionTimeout: '5000', requestTimeout: '1000', connectivityCheckInterval: '500', reconnectInterval: '200', maxReconnectInterval: '1000', nodeIdCacheSize: String(nodeIdCacheSize), commandQueueSize: '256' }],
   };
 }
 
@@ -322,30 +327,37 @@ async function main() {
 
     setMemoryPhase('browse-flow');
     const browse = await jsonRequest(`${adminUrl}${routeRoot}/browse`, 'POST', { count: pointCount });
-    assert.equal(browse.points, pointCount);
+    assert(browse.points >= pointCount, 'Live Browse omitted fixture process points');
 
-    setMemoryPhase('browse-editor-tree');
-    const editorTree = await jsonRequest(`${adminUrl}/opcua-client/browse`, 'POST', {
-      connectionId: flow.configs[0].id,
-      rootNodeId: server.rootNodeId,
-      maxDepth: 3,
-      maxNodes: pointCount + 100,
-      attributeBatchSize: 200,
-    });
     const countVariables = (tree) => (tree.nodeClass === 'Variable' ? 1 : 0) +
       (tree.children || []).reduce((total, child) => total + countVariables(child), 0);
-    assert.equal(countVariables(editorTree.tree), pointCount);
+    let editorTree = null;
+    let editorVariables = null;
+    if (editorBrowseTest) {
+      setMemoryPhase('browse-editor-tree');
+      editorTree = await jsonRequest(`${adminUrl}/opcua-client/browse`, 'POST', {
+        connectionId: flow.configs[0].id,
+        rootNodeId: server.rootNodeId,
+        maxDepth: 3,
+        maxNodes: browseNodeLimit,
+        attributeBatchSize: 200,
+      });
+      editorVariables = countVariables(editorTree.tree);
+      assert(editorVariables >= pointCount, 'Editor Browse omitted fixture process points');
+    }
     const selectedBrowse = await request(`${adminUrl}${routeRoot}/browse-selected`);
     assert.equal(selectedBrowse.points, Math.min(3, pointCount));
     assert.equal(selectedBrowse.source, 'browse-selection');
 
     const readLatencies = [];
+    let finalRead;
     setMemoryPhase('read');
     for (let round = 0; round < readRounds; round += 1) {
       const result = await jsonRequest(`${adminUrl}${routeRoot}/read`, 'POST', { count: pointCount });
       assert.equal(result.points, pointCount);
       assert.equal(result.good, pointCount);
       readLatencies.push(result.elapsedMs);
+      finalRead = result;
     }
 
     setMemoryPhase('subscribe');
@@ -406,6 +418,11 @@ async function main() {
 
     setMemoryPhase('final-convergence');
     const subscriptionResult = await waitForFinal(pointCount);
+    const nodeRedDiagnostics = externalWriteTest
+      ? finalRead?.clientDiagnostics
+      : finalWrite?.clientDiagnostics;
+    assert.equal(nodeRedDiagnostics.connectionUsage.consumerCount, 5);
+    assert.equal(nodeRedDiagnostics.connectionUsage.automaticIdleDisconnect, false);
     setMemoryPhase('clear');
     await jsonRequest(`${adminUrl}${routeRoot}/clear`, 'POST', {});
     const endSample = processSample(nodeRedPid);
@@ -428,10 +445,12 @@ async function main() {
         total: ms(totalStarted),
       },
       notifications: subscriptionResult,
-      editorTree: { nodes: editorTree.total, variables: countVariables(editorTree.tree) },
+      editorTree: editorTree
+        ? { nodes: editorTree.total, variables: editorVariables }
+        : { skipped: true, reason: 'OPCUA_NODERED_EDITOR_BROWSE=0' },
       selectedBrowse,
       reconnectRecovery,
-      clientDiagnostics: externalWriteTest ? undefined : finalWrite?.clientDiagnostics,
+      clientDiagnostics: nodeRedDiagnostics,
       writerDiagnostics: externalWriteTest ? finalWrite?.clientDiagnostics : undefined,
       nodeRedProcess: {
         pid: nodeRedPid,

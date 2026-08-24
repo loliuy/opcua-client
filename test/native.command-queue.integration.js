@@ -11,11 +11,10 @@ function wait(milliseconds) {
 }
 
 async function startFixture(port, pointCount) {
-  const child = spawn('python3', [
-    path.join(__dirname, 'fixture', 'server.py'),
-    String(port),
-    String(pointCount),
-  ]);
+  const nativeServer = process.env.OPCUA_TEST_SERVER_BINARY;
+  const child = spawn(nativeServer || 'python3', nativeServer
+    ? [String(port), String(pointCount), '500', '0']
+    : [path.join(__dirname, 'fixture', 'server.py'), String(port), String(pointCount)]);
   let output = '';
   let errors = '';
   child.stdout.on('data', (data) => { output += data; });
@@ -26,7 +25,10 @@ async function startFixture(port, pointCount) {
     await wait(50);
   }
   const match = output.match(/RUNNING (opc\.tcp:\/\/\S+) \S+ (ns=\d+;\S+) (\d+)/);
-  if (!match) throw new Error(`Fixture did not start: ${errors}`);
+  if (!match) {
+    child.kill('SIGTERM');
+    throw new Error(`Fixture did not start: ${errors}`);
+  }
   return { child, endpoint: match[1], rootNodeId: match[2] };
 }
 
@@ -44,7 +46,7 @@ function pointNodeId(index) {
 }
 
 async function main() {
-  const pointCount = 3000;
+  const pointCount = 10000;
   const server = await startFixture(4848, pointCount);
   let clientId;
   try {
@@ -99,6 +101,8 @@ async function main() {
       variablesOnly: true,
       maxDepth: 4,
       maxNodes: pointCount + 10,
+      referencesPerNode: 1,
+      browseBatchSize: 1,
       attributeBatchSize: 50,
     });
     assert(await waitFor(() => addon.getClientDiagnostics(clientId).commandQueue.active === 1));

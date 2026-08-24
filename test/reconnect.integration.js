@@ -11,9 +11,10 @@ const port = 4847;
 const endpoint = `opc.tcp://127.0.0.1:${port}`;
 
 async function startFixture() {
-  const child = spawn('python3', [
-    path.join(__dirname, 'fixture', 'server.py'), String(port), '20', '500',
-  ]);
+  const nativeServer = process.env.OPCUA_TEST_SERVER_BINARY;
+  const child = spawn(nativeServer || 'python3', nativeServer
+    ? [String(port), '20', '500', '0']
+    : [path.join(__dirname, 'fixture', 'server.py'), String(port), '20', '500']);
   let output = '';
   let errors = '';
   child.stdout.on('data', (data) => { output += data; });
@@ -24,7 +25,10 @@ async function startFixture() {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   const match = output.match(/RUNNING (opc\.tcp:\/\/\S+) (ns=\S+)/);
-  if (!match) throw new Error(`Fixture did not start: ${errors}`);
+  if (!match) {
+    child.kill('SIGTERM');
+    throw new Error(`Fixture did not start: ${errors}`);
+  }
   return { child, nodeId: match[2] };
 }
 

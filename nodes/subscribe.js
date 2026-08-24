@@ -1,6 +1,6 @@
 'use strict';
 
-const { messagePoints } = require('../lib/points');
+const { looksLikePointList, messagePoints } = require('../lib/points');
 
 const NOTIFICATION_CONFIG_FIELDS = new Set([
   'nodeId',
@@ -55,6 +55,43 @@ function positiveInteger(value, fallback) {
   return Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
 }
 
+function monitoringSettings(point, config) {
+  return {
+    samplingInterval: Number(point.samplingInterval) || Number(config.samplingInterval) || 1000,
+    queueSize: positiveInteger(point.queueSize, positiveInteger(config.queueSize, 1)),
+    discardOldest: point.discardOldest !== false,
+    deadbandType: point.deadbandType || config.deadbandType || 'none',
+    deadbandValue: Number(point.deadbandValue ?? config.deadbandValue) || 0,
+  };
+}
+
+function sameMonitoringSettings(left, right, config) {
+  const leftSettings = monitoringSettings(left, config);
+  const rightSettings = monitoringSettings(right, config);
+  return Object.keys(leftSettings).every(
+    (key) => leftSettings[key] === rightSettings[key]
+  );
+}
+
+function numericRange(items, field) {
+  let count = 0;
+  let minimum = Infinity;
+  let maximum = -Infinity;
+  for (const item of items) {
+    if (item[field] == null) continue;
+    const value = Number(item[field]);
+    if (!Number.isFinite(value)) continue;
+    count += 1;
+    minimum = Math.min(minimum, value);
+    maximum = Math.max(maximum, value);
+  }
+  return {
+    count,
+    minimum: count ? minimum : null,
+    maximum: count ? maximum : null,
+  };
+}
+
 module.exports = function registerSubscribeNode(RED) {
   function OpcUaSubscribeNode(config) {
     RED.nodes.createNode(this, config);
@@ -63,6 +100,7 @@ module.exports = function registerSubscribeNode(RED) {
     node.subscriptions = new Map();
     node.desired = new Map();
     node.monitored = new Map();
+    node.failed = new Map();
     node.subscriptionDiagnostics = new Map();
     node.pendingChanges = [];
     node.flushTimer = null;
@@ -73,6 +111,9 @@ module.exports = function registerSubscribeNode(RED) {
     node.closing = false;
     node.lastDropped = 0;
     node.lastStatusAt = 0;
+    const consumer = node.connection?.registerConsumer?.('subscribe', {
+      nodeId: config.id, name: config.name,
+    });
 
     const batchSize = positiveInteger(config.batchSize, 500);
     const callbackBatchSize = positiveInteger(config.callbackBatchSize, 500);
@@ -253,6 +294,9 @@ module.exports = function registerSubscribeNode(RED) {
         id: null,
         monitored: new Map(),
         limit: subscriptionCapacity(),
+        revisedPublishingInterval: null,
+        revisedLifetimeCount: null,
+        revisedMaxKeepAliveCount: null,
       };
       const result = await node.connection.client.createSubscription({
         publishingInterval: Number(config.publishingInterval) || 1000,
@@ -265,6 +309,9 @@ module.exports = function registerSubscribeNode(RED) {
         overflowPolicy: config.overflowPolicy || 'drop-oldest',
       }, (batch) => onNativeBatch(record, batch));
       record.id = result.subscriptionId;
+      record.revisedPublishingInterval = result.revisedPublishingInterval ?? null;
+      record.revisedLifetimeCount = result.revisedLifetimeCount ?? null;
+      record.revisedMaxKeepAliveCount = result.revisedMaxKeepAliveCount ?? null;
       node.subscriptions.set(record.id, record);
       return record;
     }
@@ -291,6 +338,8 @@ module.exports = function registerSubscribeNode(RED) {
           subscriptionId: record.id,
           monitoredItemId: result.monitoredItemId,
           clientHandle: result.clientHandle,
+          revisedSamplingInterval: result.revisedSamplingInterval ?? null,
+          revisedQueueSize: result.revisedQueueSize ?? null,
         };
         record.monitored.set(result.nodeId, monitored);
         node.monitored.set(result.nodeId, monitored);
@@ -343,10 +392,10 @@ module.exports = function registerSubscribeNode(RED) {
       return failures;
     }
 
-    async function removeUndesiredPoints() {
+    async function removeMonitoredPoints(nodeIds) {
       const grouped = new Map();
       for (const [nodeId, monitored] of node.monitored) {
-        if (node.desired.has(nodeId)) continue;
+        if (!nodeIds.has(nodeId)) continue;
         if (!grouped.has(monitored.subscriptionId)) grouped.set(monitored.subscriptionId, []);
         grouped.get(monitored.subscriptionId).push({ nodeId, ...monitored });
       }
@@ -367,6 +416,13 @@ module.exports = function registerSubscribeNode(RED) {
       }
     }
 
+    async function removeUndesiredPoints() {
+      const nodeIds = new Set(
+        [...node.monitored.keys()].filter((nodeId) => !node.desired.has(nodeId))
+      );
+      await removeMonitoredPoints(nodeIds);
+    }
+
     async function pruneEmptySubscriptions() {
       const empty = [...node.subscriptions.values()].filter(
         (record) => record.monitored.size === 0
@@ -380,7 +436,10 @@ module.exports = function registerSubscribeNode(RED) {
     }
 
     async function clearSubscriptions(keepDesired = false, ignoreErrors = false) {
-      if (!keepDesired) node.desired.clear();
+      if (!keepDesired) {
+        node.desired.clear();
+        node.failed.clear();
+      }
       discardPendingChanges();
       const records = [...node.subscriptions.values()];
       node.subscriptions.clear();
@@ -403,22 +462,49 @@ module.exports = function registerSubscribeNode(RED) {
       return true;
     }
 
-    function statusPayload(command, failed = 0) {
+    function failurePayload() {
+      const failures = [...node.failed.values()];
+      return {
+        failed: failures.length,
+        failures: failures.slice(0, 100),
+        failuresTruncated: failures.length > 100,
+      };
+    }
+
+    function statusPayload(command) {
       const ids = subscriptionIds();
+      const monitoredValues = [...node.monitored.values()];
+      const revisedSampling = numericRange(monitoredValues, 'revisedSamplingInterval');
+      const revisedQueues = numericRange(monitoredValues, 'revisedQueueSize');
       return {
         command,
         desired: node.desired.size,
         monitored: node.monitored.size,
-        failed,
+        ...failurePayload(),
         subscriptionCount: ids.length,
         subscriptionId: ids[0] ?? null,
         subscriptionIds: ids,
+        revisions: [...node.subscriptions.values()].map((record) => ({
+          subscriptionId: record.id,
+          publishingInterval: record.revisedPublishingInterval,
+          lifetimeCount: record.revisedLifetimeCount,
+          maxKeepAliveCount: record.revisedMaxKeepAliveCount,
+        })),
+        monitoredRevisions: {
+          count: Math.max(revisedSampling.count, revisedQueues.count),
+          samplingIntervalMin: revisedSampling.minimum,
+          samplingIntervalMax: revisedSampling.maximum,
+          queueSizeMin: revisedQueues.minimum,
+          queueSizeMax: revisedQueues.maximum,
+        },
         connectionGovernance: node.connection?.getConnectionGovernance?.(),
+        connectionUsage: node.connection?.getConnectionUsage?.(),
       };
     }
 
     async function reconcileSubscriptions(reason = 'state') {
       if (node.closing) return;
+      consumer?.markUsed('subscribe-reconcile');
       if (!node.desired.size) {
         if (node.subscriptions.size) await clearSubscriptions(true);
         return;
@@ -439,15 +525,21 @@ module.exports = function registerSubscribeNode(RED) {
         (point) => !node.monitored.has(point.nodeId)
       );
       const failures = await addDesiredPoints(additions);
-      await pruneEmptySubscriptions();
-      if (failures.length) {
-        throw new Error(`${failures.length} monitored item(s) failed to reconcile`);
+      for (const point of additions) node.failed.delete(point.nodeId);
+      for (const failure of failures) {
+        node.failed.set(failure.nodeId, {
+          nodeId: failure.nodeId,
+          statusCode: failure.statusCode || 'BadUnexpectedError',
+        });
       }
+      await pruneEmptySubscriptions();
 
       node.reconcileAttempt = 0;
       node.status({
-        fill: 'green', shape: 'dot',
-        text: `${node.monitored.size} monitored / ${node.subscriptions.size} sub`,
+        fill: failures.length ? 'yellow' : 'green',
+        shape: failures.length ? 'ring' : 'dot',
+        text: `${node.monitored.size} monitored / ${node.subscriptions.size} sub` +
+          (failures.length ? ` / ${failures.length} failed` : ''),
       });
       if (reason !== 'command') {
         node.send({
@@ -462,12 +554,25 @@ module.exports = function registerSubscribeNode(RED) {
           },
         });
       }
+      return { rebuilt, failures };
     }
 
     async function replacePoints(points) {
-      node.desired = new Map(points.map((point) => [point.nodeId, point]));
-      await clearSubscriptions(true);
-      await reconcileSubscriptions('command');
+      const nextDesired = new Map(points.map((point) => [point.nodeId, point]));
+      const changed = new Set();
+      for (const [nodeId, monitored] of node.monitored) {
+        const previous = node.desired.get(nodeId);
+        const next = nextDesired.get(nodeId);
+        if (!next || !previous || !sameMonitoringSettings(previous, next, config)) {
+          changed.add(nodeId);
+        }
+      }
+      node.desired = nextDesired;
+      for (const nodeId of [...node.failed.keys()]) {
+        if (!node.desired.has(nodeId)) node.failed.delete(nodeId);
+      }
+      await removeMonitoredPoints(changed);
+      return reconcileSubscriptions('command');
     }
 
     function runSerialized(task) {
@@ -517,28 +622,49 @@ module.exports = function registerSubscribeNode(RED) {
       if (!node.connection) return done(new Error('OPC UA connection not configured'));
       try {
         const command = msg.opcua?.command || 'replace';
-        const points = command === 'clear' ? [] : messagePoints(msg, config.nodeId, {
+        const dynamicNodeId = msg.nodeId || msg.topic;
+        const configuredPayload = !looksLikePointList(msg.payload) && !Array.isArray(msg.items) &&
+          !dynamicNodeId ? config.pointList : '';
+        const staticNodeId = dynamicNodeId ? '' : config.nodeId;
+        const points = command === 'clear' ? [] : messagePoints(msg, staticNodeId, {
           samplingInterval: Number(config.samplingInterval) || 1000,
           queueSize: Number(config.queueSize) || 10,
           discardOldest: config.discardOldest !== false,
+        }, {
+          configuredPayload,
+          format: 'auto',
         });
 
         node.status({ fill: 'blue', shape: 'dot', text: `${command} ${points.length}` });
         await runSerialized(async () => {
           if (command === 'replace') await replacePoints(points);
           else if (command === 'add') {
-            points.forEach((point) => node.desired.set(point.nodeId, point));
+            const changed = new Set();
+            points.forEach((point) => {
+              const previous = node.desired.get(point.nodeId);
+              if (previous && !sameMonitoringSettings(previous, point, config)) {
+                changed.add(point.nodeId);
+              }
+              node.desired.set(point.nodeId, point);
+              node.failed.delete(point.nodeId);
+            });
+            await removeMonitoredPoints(changed);
             await reconcileSubscriptions('command');
           } else if (command === 'remove') {
-            points.forEach((point) => node.desired.delete(point.nodeId));
+            points.forEach((point) => {
+              node.desired.delete(point.nodeId);
+              node.failed.delete(point.nodeId);
+            });
             await reconcileSubscriptions('command');
           } else if (command === 'clear') await clearSubscriptions();
           else throw new Error(`Unsupported subscription command: ${command}`);
         });
 
+        const failed = node.failed.size;
         node.status({
-          fill: 'green', shape: 'dot',
-          text: `${node.monitored.size} monitored / ${node.subscriptions.size} sub`,
+          fill: failed ? 'yellow' : 'green', shape: failed ? 'ring' : 'dot',
+          text: `${node.monitored.size} monitored / ${node.subscriptions.size} sub` +
+            (failed ? ` / ${failed} failed` : ''),
         });
         send({
           ...msg,
@@ -552,20 +678,63 @@ module.exports = function registerSubscribeNode(RED) {
       }
     });
 
-    node.on('close', async (done) => {
+    async function cleanupSubscription() {
       node.closing = true;
       if (node.reconnectTimer) clearTimeout(node.reconnectTimer);
+      node.reconnectTimer = null;
       discardPendingChanges();
       node.connection?.client.off('fault', onFault);
       node.connection?.client.off('state', onState);
       node.desired.clear();
+      node.failed.clear();
+      consumer?.release();
+      await runSerialized(() => clearSubscriptions());
+    }
+
+    const runCleanup = node.connection?.registerDependentCleanup?.(cleanupSubscription) ||
+      cleanupSubscription;
+
+    node.on('close', async (done) => {
       try {
-        await runSerialized(() => clearSubscriptions());
+        await runCleanup();
       } catch (error) {
         node.warn(`OPC UA subscription cleanup failed: ${error.message}`);
       }
       done();
     });
+
+    const configuredPoints = String(config.pointList || '').trim() ||
+      String(config.nodeId || '').trim();
+    if (configuredPoints) {
+      setImmediate(() => {
+        if (node.closing) return;
+        let points;
+        try {
+          points = messagePoints({}, config.nodeId, {
+            samplingInterval: Number(config.samplingInterval) || 1000,
+            queueSize: Number(config.queueSize) || 10,
+            discardOldest: config.discardOldest !== false,
+          }, {
+            configuredPayload: config.pointList,
+            format: 'auto',
+          });
+        } catch (error) {
+          node.status({ fill: 'red', shape: 'ring', text: error.message });
+          node.warn(`OPC UA saved subscription point list is invalid: ${error.message}`);
+          return;
+        }
+        void runSerialized(() => replacePoints(points)).then(() => {
+          node.send({
+            payload: statusPayload('startup'),
+            opcua: { operation: 'subscription-status', startup: true },
+          });
+        }).catch((error) => {
+          node.status({ fill: 'yellow', shape: 'ring', text: 'waiting to subscribe' });
+          node.warn(`OPC UA startup subscription failed: ${error.message}`);
+          scheduleReconnect('startup');
+        });
+      });
+    }
   }
 
   RED.nodes.registerType('tier0-opcua-subscribe', OpcUaSubscribeNode);

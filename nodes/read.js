@@ -27,11 +27,15 @@ module.exports = function registerReadNode(RED) {
     RED.nodes.createNode(this, config);
     const node = this;
     node.connection = RED.nodes.getNode(config.connection);
+    const consumer = node.connection?.registerConsumer?.('read', {
+      nodeId: config.id, name: config.name,
+    });
 
     node.on('input', async (msg, send, done) => {
       if (!node.connection) return done(new Error('OPC UA connection not configured'));
 
       try {
+        consumer?.markUsed('read');
         const points = messagePoints(msg, config.nodeId, {
           indexRange: config.indexRange,
         }, {
@@ -98,6 +102,12 @@ module.exports = function registerReadNode(RED) {
         node.status({ fill: 'red', shape: 'ring', text: error.message });
         done(error);
       }
+    });
+
+    node.on('close', (removed, done) => {
+      if (typeof removed === 'function') done = removed;
+      consumer?.release();
+      done?.();
     });
   }
 

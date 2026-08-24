@@ -12,6 +12,8 @@ function wait(milliseconds) {
 function createHarness(serverLimit = 2, configOverrides = {}) {
   const client = new EventEmitter();
   const subscriptions = new Map();
+  const dependentCleanups = new Set();
+  const calls = { create: 0, add: [], remove: [], delete: [] };
   let nextSubscriptionId = 0;
   let nextMonitoredItemId = 0;
 
@@ -19,6 +21,7 @@ function createHarness(serverLimit = 2, configOverrides = {}) {
     operationLimits: { maxMonitoredItemsPerSubscription: serverLimit },
   });
   client.createSubscription = async (options, callback) => {
+    calls.create += 1;
     const id = ++nextSubscriptionId;
     subscriptions.set(id, {
       id,
@@ -27,15 +30,24 @@ function createHarness(serverLimit = 2, configOverrides = {}) {
       nextClientHandle: 1,
       monitored: new Map(),
     });
-    return { subscriptionId: id, statusCode: 'Good' };
+    return {
+      subscriptionId: id,
+      statusCode: 'Good',
+      revisedPublishingInterval: options.publishingInterval,
+      revisedLifetimeCount: options.lifetimeCount,
+      revisedMaxKeepAliveCount: options.maxKeepAliveCount,
+    };
   };
   client.addMonitoredItems = async (subscriptionId, points) => {
+    calls.add.push({ subscriptionId, nodeIds: points.map((point) => point.nodeId) });
     const subscription = subscriptions.get(subscriptionId);
     return points.map((point) => {
       const result = {
         nodeId: point.nodeId,
         monitoredItemId: ++nextMonitoredItemId,
         clientHandle: subscription.nextClientHandle++,
+        revisedSamplingInterval: point.samplingInterval,
+        revisedQueueSize: point.queueSize,
         statusCode: 'Good',
       };
       subscription.monitored.set(result.monitoredItemId, point.nodeId);
@@ -43,6 +55,7 @@ function createHarness(serverLimit = 2, configOverrides = {}) {
     });
   };
   client.removeMonitoredItems = async (subscriptionId, ids) => {
+    calls.remove.push({ subscriptionId, ids: [...ids] });
     const subscription = subscriptions.get(subscriptionId);
     return ids.map((id) => {
       subscription.monitored.delete(id);
@@ -50,6 +63,7 @@ function createHarness(serverLimit = 2, configOverrides = {}) {
     });
   };
   client.deleteSubscription = async (subscriptionId) => {
+    calls.delete.push(subscriptionId);
     subscriptions.delete(subscriptionId);
     return { statusCode: 'Good' };
   };
@@ -59,6 +73,20 @@ function createHarness(serverLimit = 2, configOverrides = {}) {
   });
 
   let Constructor;
+  const connection = {
+    client,
+    registerDependentCleanup(cleanup) {
+      let promise = null;
+      const run = () => {
+        if (!promise) {
+          promise = Promise.resolve().then(cleanup).finally(() => dependentCleanups.delete(run));
+        }
+        return promise;
+      };
+      dependentCleanups.add(run);
+      return run;
+    },
+  };
   const RED = {
     nodes: {
       createNode(node) {
@@ -73,7 +101,7 @@ function createHarness(serverLimit = 2, configOverrides = {}) {
         node.status = (status) => node.statuses.push(status);
         node.warn = (warning) => node.warnings.push(warning);
       },
-      getNode: () => ({ client }),
+      getNode: () => connection,
       registerType(name, constructor) {
         assert.equal(name, 'tier0-opcua-subscribe');
         Constructor = constructor;
@@ -106,7 +134,7 @@ function createHarness(serverLimit = 2, configOverrides = {}) {
     await new Promise((resolve) => node.emit('close', resolve));
   }
 
-  return { client, close, input, node, subscriptions };
+  return { calls, client, close, dependentCleanups, input, node, subscriptions };
 }
 
 test('shards monitored items by the server subscription limit', async () => {
@@ -147,6 +175,94 @@ test('supports cross-subscription removal and reuses available capacity', async 
   assert.deepEqual([...harness.node.monitored.keys()].sort(), [
     'ns=2;s=A', 'ns=2;s=D', 'ns=2;s=E', 'ns=2;s=F',
   ]);
+
+  await harness.close();
+});
+
+test('reconciles identical replace commands without rebuilding monitored items', async () => {
+  const harness = createHarness(10);
+  await harness.input({ payload: [
+    { nodeId: 'ns=2;s=A', alias: 'old-a', samplingInterval: 100 },
+    { nodeId: 'ns=2;s=B', samplingInterval: 100 },
+  ] });
+  const initial = {
+    create: harness.calls.create,
+    add: harness.calls.add.length,
+    remove: harness.calls.remove.length,
+    delete: harness.calls.delete.length,
+  };
+
+  await harness.input({ payload: [
+    { nodeId: 'ns=2;s=A', alias: 'new-a', samplingInterval: 100 },
+    { nodeId: 'ns=2;s=B', samplingInterval: 100 },
+  ] });
+
+  assert.deepEqual({
+    create: harness.calls.create,
+    add: harness.calls.add.length,
+    remove: harness.calls.remove.length,
+    delete: harness.calls.delete.length,
+  }, initial);
+  assert.equal(harness.node.desired.get('ns=2;s=A').alias, 'new-a');
+
+  await harness.input({ payload: [
+    { nodeId: 'ns=2;s=A', alias: 'new-a', samplingInterval: 250 },
+    { nodeId: 'ns=2;s=B', samplingInterval: 100 },
+  ] });
+  assert.equal(harness.calls.create, initial.create);
+  assert.equal(harness.calls.delete.length, initial.delete);
+  assert.equal(harness.calls.remove.length, initial.remove + 1);
+  assert.equal(harness.calls.add.length, initial.add + 1);
+  assert.deepEqual(harness.calls.add.at(-1).nodeIds, ['ns=2;s=A']);
+
+  await harness.close();
+});
+
+test('reports individual monitored-item failures without rejecting successful points', async () => {
+  const harness = createHarness(10);
+  const addMonitoredItems = harness.client.addMonitoredItems;
+  harness.client.addMonitoredItems = async (...args) => {
+    const results = await addMonitoredItems(...args);
+    const failed = results.find((result) => result.nodeId === 'ns=2;s=Bad');
+    if (failed) {
+      const subscription = harness.subscriptions.get(args[0]);
+      subscription.monitored.delete(failed.monitoredItemId);
+      failed.monitoredItemId = 0;
+      failed.statusCode = 'BadNodeIdUnknown';
+    }
+    return results;
+  };
+
+  await harness.input({ payload: ['ns=2;s=A', 'ns=2;s=Bad', 'ns=2;s=B'] });
+
+  const status = harness.node.sent.at(-1).payload;
+  assert.equal(status.desired, 3);
+  assert.equal(status.monitored, 2);
+  assert.equal(status.failed, 1);
+  assert.deepEqual(status.failures, [{
+    nodeId: 'ns=2;s=Bad', statusCode: 'BadNodeIdUnknown',
+  }]);
+  assert.equal(harness.node.statuses.at(-1).fill, 'yellow');
+
+  await harness.close();
+});
+
+test('starts a saved point list automatically after deploy', async () => {
+  const harness = createHarness(10, {
+    pointList: JSON.stringify([
+      { nodeId: 'ns=2;s=A', samplingInterval: 100 },
+      { nodeId: 'ns=2;s=B', samplingInterval: 100 },
+    ]),
+  });
+
+  for (let attempt = 0; attempt < 20 && harness.node.monitored.size !== 2; attempt += 1) {
+    await wait(5);
+  }
+  assert.equal(harness.node.monitored.size, 2);
+  assert.equal(harness.calls.create, 1);
+  const startup = harness.node.sent.find((message) => message.opcua?.startup === true);
+  assert.equal(startup?.payload.command, 'startup');
+  assert.equal(startup?.payload.failed, 0);
 
   await harness.close();
 });
@@ -246,6 +362,27 @@ test('waits for in-flight reconciliation before cleaning up on close', async () 
   assert.equal(harness.node.subscriptions.size, 0);
   assert.equal(harness.node.monitored.size, 0);
   assert.equal(harness.node.desired.size, 0);
+});
+
+test('shares one idempotent subscription cleanup with Connection shutdown', async () => {
+  const harness = createHarness(10);
+  let deletes = 0;
+  const deleteSubscription = harness.client.deleteSubscription;
+  harness.client.deleteSubscription = async (...args) => {
+    deletes += 1;
+    await wait(10);
+    return deleteSubscription(...args);
+  };
+  await harness.input({ payload: ['ns=2;s=A'] });
+  assert.equal(harness.dependentCleanups.size, 1);
+  const connectionCleanup = [...harness.dependentCleanups][0];
+
+  await Promise.all([harness.close(), connectionCleanup()]);
+
+  assert.equal(deletes, 1);
+  assert.equal(harness.subscriptions.size, 0);
+  assert.equal(harness.dependentCleanups.size, 0);
+  assert.equal(harness.node.warnings.length, 0);
 });
 
 test('compact output omits Browse, native handle, server timestamp, and subscription metadata', async () => {

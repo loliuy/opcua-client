@@ -7,11 +7,15 @@ module.exports = function registerWriteNode(RED) {
     RED.nodes.createNode(this, config);
     const node = this;
     node.connection = RED.nodes.getNode(config.connection);
+    const consumer = node.connection?.registerConsumer?.('write', {
+      nodeId: config.id, name: config.name,
+    });
 
     node.on('input', async (msg, send, done) => {
       if (!node.connection) return done(new Error('OPC UA connection not configured'));
 
       try {
+        consumer?.markUsed('write');
         const points = messageWritePoints(msg, config);
         node.status({ fill: 'blue', shape: 'dot', text: `writing ${points.length}` });
         const results = await node.connection.client.writeMany(
@@ -40,6 +44,12 @@ module.exports = function registerWriteNode(RED) {
         node.status({ fill: 'red', shape: 'ring', text: error.message });
         done(error);
       }
+    });
+
+    node.on('close', (removed, done) => {
+      if (typeof removed === 'function') done = removed;
+      consumer?.release();
+      done?.();
     });
   }
 
