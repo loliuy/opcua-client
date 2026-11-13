@@ -1,5 +1,7 @@
 'use strict';
 
+const { createDiagnostics } = require('../lib/diagnostics');
+
 const { looksLikePointList, messagePoints } = require('../lib/points');
 
 const COMPACT_RESULT_FIELDS = Object.freeze([
@@ -27,13 +29,20 @@ module.exports = function registerReadNode(RED) {
     RED.nodes.createNode(this, config);
     const node = this;
     node.connection = RED.nodes.getNode(config.connection);
+    const diagnostics = createDiagnostics(node, config, 'read');
     const consumer = node.connection?.registerConsumer?.('read', {
       nodeId: config.id, name: config.name,
     });
 
     node.on('input', async (msg, send, done) => {
-      if (!node.connection) return done(new Error('OPC UA connection not configured'));
+      if (!node.connection) {
+        const error = new Error('OPCUA_CONNECTION_NOT_CONFIGURED');
+        diagnostics.failure(error, send);
+        return done(error);
+      }
 
+      diagnostics.beginInput();
+      let inputError;
       try {
         consumer?.markUsed('read');
         const points = messagePoints(msg, config.nodeId, {
@@ -55,6 +64,7 @@ module.exports = function registerReadNode(RED) {
 
         // Undefined preserves the original output for Flow JSON created before
         // resultDetail was introduced. New editor nodes explicitly save compact.
+        const failed = diagnostics.results(results, send);
         const resultDetail = config.resultDetail || 'full';
         const outputResults = resultDetail === 'compact'
           ? results.map(compactResult)
@@ -96,11 +106,16 @@ module.exports = function registerReadNode(RED) {
           send(msg);
         }
 
-        node.status({ fill: 'green', shape: 'dot', text: `${results.length} read` });
+        node.status({ fill: failed ? 'yellow' : 'green', shape: failed ? 'ring' : 'dot',
+          text: `${results.length - failed}/${results.length} read` + (failed ? ` / ${failed} failed` : '') });
         done();
       } catch (error) {
+        inputError = error;
         node.status({ fill: 'red', shape: 'ring', text: error.message });
+        diagnostics.failure(error, send);
         done(error);
+      } finally {
+        diagnostics.endInput(inputError);
       }
     });
 

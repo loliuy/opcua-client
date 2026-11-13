@@ -3,6 +3,7 @@
 const { OpcUaClient, discoverEndpoints } = require('../lib/client');
 const { ConnectionRegistry } = require('../lib/connection-registry');
 const { SecurityFileStore } = require('../lib/security-file-store');
+const { normalizeCompatibilityProfile } = require('../lib/compatibility');
 
 function pathList(value) {
   const source = Array.isArray(value) ? value : String(value || '').split(/\r?\n|;/);
@@ -14,6 +15,7 @@ function clientOptions(config, credentials = {}) {
     endpoint: config.endpoint,
     securityMode: config.securityMode || 'None',
     securityPolicy: config.securityPolicy || 'None',
+    compatibilityProfile: normalizeCompatibilityProfile(config.compatibilityProfile),
     user: config.user || '',
     password: credentials.password || '',
     certificate: config.certificate || '',
@@ -233,19 +235,13 @@ module.exports = function registerConnectionNode(RED) {
       );
     }
 
-    const onFault = (error) => node.warn(`OPC UA connection fault: ${error.message}`);
-    const onState = (state) => {
-      if (state.state === 'failed') node.warn(`OPC UA connection failed: ${state.statusCode}`);
-    };
-    node.client.on('fault', onFault);
-    node.client.on('state', onState);
+    // Operation nodes report connection faults to their own flow's Catch nodes.
+    // Logging here too duplicates each shared-connection failure globally.
     node.on('close', async (removed, done) => {
       if (typeof removed === 'function') {
         done = removed;
         removed = false;
       }
-      node.client.off('fault', onFault);
-      node.client.off('state', onState);
       registration.unregister();
       const cleanupResults = await Promise.allSettled(
         [...dependentCleanups].map(runDependentCleanup)

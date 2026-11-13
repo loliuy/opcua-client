@@ -1,6 +1,9 @@
 'use strict';
 
+const { createDiagnostics } = require('../lib/diagnostics');
+
 const { looksLikePointList, messagePoints } = require('../lib/points');
+const { SIEMENS_WINCC_DEFAULTS, isSiemensWinCC } = require('../lib/compatibility');
 
 const NOTIFICATION_CONFIG_FIELDS = new Set([
   'nodeId',
@@ -55,19 +58,19 @@ function positiveInteger(value, fallback) {
   return Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
 }
 
-function monitoringSettings(point, config) {
+function monitoringSettings(point, config, siemensWincc = false) {
   return {
     samplingInterval: Number(point.samplingInterval) || Number(config.samplingInterval) || 1000,
     queueSize: positiveInteger(point.queueSize, positiveInteger(config.queueSize, 1)),
     discardOldest: point.discardOldest !== false,
-    deadbandType: point.deadbandType || config.deadbandType || 'none',
-    deadbandValue: Number(point.deadbandValue ?? config.deadbandValue) || 0,
+    deadbandType: siemensWincc ? 'none' : point.deadbandType || config.deadbandType || 'none',
+    deadbandValue: siemensWincc ? 0 : Number(point.deadbandValue ?? config.deadbandValue) || 0,
   };
 }
 
-function sameMonitoringSettings(left, right, config) {
-  const leftSettings = monitoringSettings(left, config);
-  const rightSettings = monitoringSettings(right, config);
+function sameMonitoringSettings(left, right, config, siemensWincc = false) {
+  const leftSettings = monitoringSettings(left, config, siemensWincc);
+  const rightSettings = monitoringSettings(right, config, siemensWincc);
   return Object.keys(leftSettings).every(
     (key) => leftSettings[key] === rightSettings[key]
   );
@@ -97,6 +100,7 @@ module.exports = function registerSubscribeNode(RED) {
     RED.nodes.createNode(this, config);
     const node = this;
     node.connection = RED.nodes.getNode(config.connection);
+    const diagnostics = createDiagnostics(node, config, 'subscribe');
     node.subscriptions = new Map();
     node.desired = new Map();
     node.monitored = new Map();
@@ -111,6 +115,7 @@ module.exports = function registerSubscribeNode(RED) {
     node.closing = false;
     node.lastDropped = 0;
     node.lastStatusAt = 0;
+    node.compatibilityWarningIssued = false;
     const consumer = node.connection?.registerConsumer?.('subscribe', {
       nodeId: config.id, name: config.name,
     });
@@ -118,7 +123,16 @@ module.exports = function registerSubscribeNode(RED) {
     const batchSize = positiveInteger(config.batchSize, 500);
     const callbackBatchSize = positiveInteger(config.callbackBatchSize, 500);
     const callbackFlushIntervalMs = positiveInteger(config.callbackFlushIntervalMs, 50);
-    const configuredSubscriptionCapacity = positiveInteger(config.maxItemsPerSubscription, 5000);
+    const siemensWincc = isSiemensWinCC(
+      node.connection?.client?.options?.compatibilityProfile
+    );
+    const requestedSubscriptionCapacity = positiveInteger(config.maxItemsPerSubscription, 5000);
+    const configuredSubscriptionCapacity = siemensWincc
+      ? Math.min(
+          requestedSubscriptionCapacity,
+          SIEMENS_WINCC_DEFAULTS.monitoredItemsPerSubscription
+        )
+      : requestedSubscriptionCapacity;
     // Undefined preserves the descriptor-rich output used by Flow JSON created
     // before resultDetail existed. New editor nodes explicitly save compact.
     const resultDetail = ['compact', 'value', 'full'].includes(config.resultDetail)
@@ -127,6 +141,24 @@ module.exports = function registerSubscribeNode(RED) {
 
     function subscriptionIds() {
       return [...node.subscriptions.keys()];
+    }
+
+    function applyCompatibility(points) {
+      if (!siemensWincc) return points;
+      let removedDeadband = false;
+      const compatible = points.map((point) => {
+        const configuredType = point.deadbandType || config.deadbandType || 'none';
+        if (configuredType === 'none') return point;
+        removedDeadband = true;
+        return { ...point, deadbandType: 'none', deadbandValue: 0 };
+      });
+      if (removedDeadband && !node.compatibilityWarningIssued) {
+        node.compatibilityWarningIssued = true;
+        node.warn(
+          'Siemens WinCC does not support OPC UA DataChange Deadband filters; Deadband was disabled.'
+        );
+      }
+      return compatible;
     }
 
     function primarySubscriptionId() {
@@ -175,6 +207,7 @@ module.exports = function registerSubscribeNode(RED) {
     function updateQueueWarning(diagnostics) {
       const dropped = Number(diagnostics.dropped) || 0;
       if (dropped > node.lastDropped) {
+        diagnostics.emit('warn', 'queue_overflow', 'OPC UA notification queue dropped changes', { dropped });
         node.warn(`OPC UA notification queue dropped ${dropped - node.lastDropped} change(s); total ${dropped}`);
       }
       node.lastDropped = dropped;
@@ -243,9 +276,10 @@ module.exports = function registerSubscribeNode(RED) {
 
     function onNativeBatch(record, batch) {
       if (node.closing || !record.id || !node.subscriptions.has(record.id)) return;
-      const diagnostics = batch.diagnostics || {};
-      node.subscriptionDiagnostics.set(record.id, diagnostics);
+      const queueDiagnostics = batch.diagnostics || {};
+      node.subscriptionDiagnostics.set(record.id, queueDiagnostics);
       const sourceChanges = batch.changes || [];
+      diagnostics.results(sourceChanges.filter((change) => node.desired.has(change.nodeId)), undefined, node.desired);
       const changes = [];
       for (let index = 0; index < sourceChanges.length; index += 1) {
         const change = sourceChanges[index];
@@ -325,8 +359,8 @@ module.exports = function registerSubscribeNode(RED) {
           samplingInterval: Number(config.samplingInterval) || 1000,
           queueSize: Number(config.queueSize) || 10,
           discardOldest: config.discardOldest !== false,
-          deadbandType: config.deadbandType || 'none',
-          deadbandValue: Number(config.deadbandValue) || 0,
+          deadbandType: siemensWincc ? 'none' : config.deadbandType || 'none',
+          deadbandValue: siemensWincc ? 0 : Number(config.deadbandValue) || 0,
           timestampMode: config.timestampMode || 'source',
         },
         batchSize
@@ -497,6 +531,11 @@ module.exports = function registerSubscribeNode(RED) {
           queueSizeMin: revisedQueues.minimum,
           queueSizeMax: revisedQueues.maximum,
         },
+        compatibility: {
+          profile: siemensWincc ? 'siemens-wincc' : 'standard',
+          deadbandSupported: !siemensWincc,
+          monitoredItemsPerSubscription: configuredSubscriptionCapacity,
+        },
         connectionGovernance: node.connection?.getConnectionGovernance?.(),
         connectionUsage: node.connection?.getConnectionUsage?.(),
       };
@@ -513,7 +552,9 @@ module.exports = function registerSubscribeNode(RED) {
       let rebuilt = false;
       if (node.subscriptions.size) {
         let valid = false;
-        try { valid = await validateSubscriptions(); } catch {}
+        try { valid = await validateSubscriptions(); } catch (error) {
+          diagnostics.failure(error, undefined, 'subscription_validation_failed', true);
+        }
         if (!valid) {
           await clearSubscriptions(true, true);
           rebuilt = true;
@@ -534,6 +575,8 @@ module.exports = function registerSubscribeNode(RED) {
       }
       await pruneEmptySubscriptions();
 
+      diagnostics.results(failures, undefined, node.desired);
+      if (!failures.length) diagnostics.recovered('subscription');
       node.reconcileAttempt = 0;
       node.status({
         fill: failures.length ? 'yellow' : 'green',
@@ -542,7 +585,12 @@ module.exports = function registerSubscribeNode(RED) {
           (failures.length ? ` / ${failures.length} failed` : ''),
       });
       if (reason !== 'command') {
-        node.send({
+        diagnostics.emit(failures.length ? 'warn' : 'info', failures.length ? 'subscription_recovery_partial' : 'subscription_restored',
+          'OPC UA subscription reconciliation completed; data receipt is not yet confirmed', {
+            failed: failures.length, monitored: node.monitored.size, desired: node.desired.size,
+            rebuilt, dataGapPossible: rebuilt,
+          });
+        if (config.statusOutput !== 'separate') node.send({
           payload: { ...statusPayload('recover'), rebuilt, reason },
           opcua: {
             operation: 'subscription-status',
@@ -563,7 +611,7 @@ module.exports = function registerSubscribeNode(RED) {
       for (const [nodeId, monitored] of node.monitored) {
         const previous = node.desired.get(nodeId);
         const next = nextDesired.get(nodeId);
-        if (!next || !previous || !sameMonitoringSettings(previous, next, config)) {
+        if (!next || !previous || !sameMonitoringSettings(previous, next, config, siemensWincc)) {
           changed.add(nodeId);
         }
       }
@@ -591,7 +639,8 @@ module.exports = function registerSubscribeNode(RED) {
         try {
           await runSerialized(() => reconcileSubscriptions(reason));
         } catch (error) {
-          node.warn(`OPC UA resubscribe failed: ${error.message}`);
+          diagnostics.failure(error, undefined, 'subscription_recovery_failed', true);
+          diagnostics.backgroundFailure(error, 'subscription_recovery_failed');
           node.status({ fill: 'yellow', shape: 'ring', text: 'waiting to recover' });
           scheduleReconnect(reason);
         }
@@ -609,6 +658,7 @@ module.exports = function registerSubscribeNode(RED) {
         scheduleReconnect(state.reason || 'connected', true);
       } else if (state.state === 'subscription-inactive' &&
                  (!state.subscriptionId || node.subscriptions.has(state.subscriptionId))) {
+        diagnostics.emit('warn', 'subscription_inactive', 'OPC UA subscription is inactive; recovery pending', { retrying: true, subscriptionId: state.subscriptionId });
         node.status({ fill: 'yellow', shape: 'ring', text: 'subscription inactive' });
         scheduleReconnect('subscription-inactive');
       } else if (['reconnecting', 'backoff', 'failed'].includes(state.state)) {
@@ -619,21 +669,27 @@ module.exports = function registerSubscribeNode(RED) {
     node.connection?.client.on('state', onState);
 
     node.on('input', async (msg, send, done) => {
-      if (!node.connection) return done(new Error('OPC UA connection not configured'));
+      if (!node.connection) {
+        const error = new Error('OPCUA_CONNECTION_NOT_CONFIGURED');
+        diagnostics.failure(error, send);
+        return done(error);
+      }
+      diagnostics.beginInput();
+      let inputError;
       try {
         const command = msg.opcua?.command || 'replace';
         const dynamicNodeId = msg.nodeId || msg.topic;
         const configuredPayload = !looksLikePointList(msg.payload) && !Array.isArray(msg.items) &&
           !dynamicNodeId ? config.pointList : '';
         const staticNodeId = dynamicNodeId ? '' : config.nodeId;
-        const points = command === 'clear' ? [] : messagePoints(msg, staticNodeId, {
+        const points = command === 'clear' ? [] : applyCompatibility(messagePoints(msg, staticNodeId, {
           samplingInterval: Number(config.samplingInterval) || 1000,
           queueSize: Number(config.queueSize) || 10,
           discardOldest: config.discardOldest !== false,
         }, {
           configuredPayload,
           format: 'auto',
-        });
+        }));
 
         node.status({ fill: 'blue', shape: 'dot', text: `${command} ${points.length}` });
         await runSerialized(async () => {
@@ -642,7 +698,7 @@ module.exports = function registerSubscribeNode(RED) {
             const changed = new Set();
             points.forEach((point) => {
               const previous = node.desired.get(point.nodeId);
-              if (previous && !sameMonitoringSettings(previous, point, config)) {
+              if (previous && !sameMonitoringSettings(previous, point, config, siemensWincc)) {
                 changed.add(point.nodeId);
               }
               node.desired.set(point.nodeId, point);
@@ -666,15 +722,22 @@ module.exports = function registerSubscribeNode(RED) {
           text: `${node.monitored.size} monitored / ${node.subscriptions.size} sub` +
             (failed ? ` / ${failed} failed` : ''),
         });
-        send({
+        diagnostics.emit(failed ? 'warn' : 'info', 'subscription_updated', 'OPC UA subscription configuration updated', {
+          failed, monitored: node.monitored.size, desired: node.desired.size,
+        }, send);
+        if (config.statusOutput !== 'separate') send({
           ...msg,
           payload: statusPayload(command),
           opcua: { operation: 'subscription-status' },
         });
         done();
       } catch (error) {
+        inputError = error;
         node.status({ fill: 'red', shape: 'ring', text: error.message });
+        diagnostics.failure(error, send);
         done(error);
+      } finally {
+        diagnostics.endInput(inputError);
       }
     });
 
@@ -710,17 +773,18 @@ module.exports = function registerSubscribeNode(RED) {
         if (node.closing) return;
         let points;
         try {
-          points = messagePoints({}, config.nodeId, {
+          points = applyCompatibility(messagePoints({}, config.nodeId, {
             samplingInterval: Number(config.samplingInterval) || 1000,
             queueSize: Number(config.queueSize) || 10,
             discardOldest: config.discardOldest !== false,
           }, {
             configuredPayload: config.pointList,
             format: 'auto',
-          });
+          }));
         } catch (error) {
           node.status({ fill: 'red', shape: 'ring', text: error.message });
-          node.warn(`OPC UA saved subscription point list is invalid: ${error.message}`);
+          diagnostics.failure(error, undefined, 'subscription_configuration_failed');
+          diagnostics.backgroundFailure(error, 'subscription_configuration_failed');
           return;
         }
         void runSerialized(() => replacePoints(points)).then(() => {
@@ -730,7 +794,8 @@ module.exports = function registerSubscribeNode(RED) {
           });
         }).catch((error) => {
           node.status({ fill: 'yellow', shape: 'ring', text: 'waiting to subscribe' });
-          node.warn(`OPC UA startup subscription failed: ${error.message}`);
+          diagnostics.failure(error, undefined, 'subscription_startup_failed', true);
+          diagnostics.backgroundFailure(error, 'subscription_startup_failed');
           scheduleReconnect('startup');
         });
       });

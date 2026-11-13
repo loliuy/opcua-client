@@ -49,6 +49,14 @@ std::string SecurityPolicyUri(const std::string& policy) {
       policy == "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256") {
     return "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256";
   }
+  if (policy == "Aes128_Sha256_RsaOaep" ||
+      policy == "http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep") {
+    return "http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep";
+  }
+  if (policy == "Aes256_Sha256_RsaPss" ||
+      policy == "http://opcfoundation.org/UA/SecurityPolicy#Aes256_Sha256_RsaPss") {
+    return "http://opcfoundation.org/UA/SecurityPolicy#Aes256_Sha256_RsaPss";
+  }
   return "";
 }
 
