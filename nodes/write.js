@@ -1,5 +1,7 @@
 'use strict';
 
+const { createDiagnostics } = require('../lib/diagnostics');
+
 const { messageWritePoints } = require('../lib/points');
 
 module.exports = function registerWriteNode(RED) {
@@ -7,13 +9,20 @@ module.exports = function registerWriteNode(RED) {
     RED.nodes.createNode(this, config);
     const node = this;
     node.connection = RED.nodes.getNode(config.connection);
+    const diagnostics = createDiagnostics(node, config, 'write');
     const consumer = node.connection?.registerConsumer?.('write', {
       nodeId: config.id, name: config.name,
     });
 
     node.on('input', async (msg, send, done) => {
-      if (!node.connection) return done(new Error('OPC UA connection not configured'));
+      if (!node.connection) {
+        const error = new Error('OPCUA_CONNECTION_NOT_CONFIGURED');
+        diagnostics.failure(error, send);
+        return done(error);
+      }
 
+      diagnostics.beginInput();
+      let inputError;
       try {
         consumer?.markUsed('write');
         const points = messageWritePoints(msg, config);
@@ -23,6 +32,7 @@ module.exports = function registerWriteNode(RED) {
           Number(config.batchSize) || 500
         );
 
+        const failed = diagnostics.results(results, send, new Map(points.map((point) => [point.nodeId, point])));
         if ((config.outputMode || 'batch') === 'split') {
           results.forEach((result) => send({ ...msg, topic: result.nodeId, opcua: result }));
         } else {
@@ -38,11 +48,16 @@ module.exports = function registerWriteNode(RED) {
           send(msg);
         }
 
-        node.status({ fill: 'green', shape: 'dot', text: `${results.length} written` });
+        node.status({ fill: failed ? 'yellow' : 'green', shape: failed ? 'ring' : 'dot',
+          text: `${results.length - failed}/${results.length} written` + (failed ? ` / ${failed} failed` : '') });
         done();
       } catch (error) {
+        inputError = error;
         node.status({ fill: 'red', shape: 'ring', text: error.message });
+        diagnostics.failure(error, send);
         done(error);
+      } finally {
+        diagnostics.endInput(inputError);
       }
     });
 

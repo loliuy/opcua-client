@@ -9,8 +9,9 @@ function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-function createHarness(serverLimit = 2, configOverrides = {}) {
+function createHarness(serverLimit = 2, configOverrides = {}, clientOptions = {}) {
   const client = new EventEmitter();
+  client.options = { ...clientOptions };
   const subscriptions = new Map();
   const dependentCleanups = new Set();
   const calls = { create: 0, add: [], remove: [], delete: [] };
@@ -39,7 +40,11 @@ function createHarness(serverLimit = 2, configOverrides = {}) {
     };
   };
   client.addMonitoredItems = async (subscriptionId, points) => {
-    calls.add.push({ subscriptionId, nodeIds: points.map((point) => point.nodeId) });
+    calls.add.push({
+      subscriptionId,
+      nodeIds: points.map((point) => point.nodeId),
+      points: points.map((point) => ({ ...point })),
+    });
     const subscription = subscriptions.get(subscriptionId);
     return points.map((point) => {
       const result = {
@@ -95,9 +100,17 @@ function createHarness(serverLimit = 2, configOverrides = {}) {
         node.off = emitter.off.bind(emitter);
         node.emit = emitter.emit.bind(emitter);
         node.sent = [];
+        node.diagnostics = [];
         node.statuses = [];
         node.warnings = [];
-        node.send = (message) => node.sent.push(message);
+        node.errors = [];
+        node.error = (error, msg) => node.errors.push({ error, msg });
+        node.send = (message) => {
+          if (Array.isArray(message)) {
+            if (message[0]) node.sent.push(message[0]);
+            if (message[1]) node.diagnostics.push(message[1]);
+          } else node.sent.push(message);
+        };
         node.status = (status) => node.statuses.push(status);
         node.warn = (warning) => node.warnings.push(warning);
       },
@@ -123,7 +136,7 @@ function createHarness(serverLimit = 2, configOverrides = {}) {
 
   async function input(message) {
     return new Promise((resolve, reject) => {
-      node.emit('input', message, (output) => node.sent.push(output), (error) => {
+      node.emit('input', message, (output) => node.send(output), (error) => {
         if (error) reject(error);
         else resolve();
       });
@@ -160,6 +173,38 @@ test('shards monitored items by the server subscription limit', async () => {
     [['ns=2;s=A', 'ns=2;s=B'], ['ns=2;s=C', 'ns=2;s=D'], ['ns=2;s=E']]
   );
 
+  await harness.close();
+});
+
+test('applies conservative Siemens WinCC capacity and removes unsupported Deadband filters', async () => {
+  const harness = createHarness(0, {
+    maxItemsPerSubscription: 5000,
+    deadbandType: 'percent',
+    deadbandValue: 2,
+  }, { compatibilityProfile: 'siemens-wincc' });
+  const points = Array.from({ length: 1001 }, (_, index) => ({
+    nodeId: `ns=2;s=Point${index}`,
+    deadbandType: index === 0 ? 'absolute' : undefined,
+    deadbandValue: index === 0 ? 1 : undefined,
+  }));
+
+  await harness.input({ payload: points });
+
+  assert.equal(harness.subscriptions.size, 2);
+  assert.deepEqual(
+    [...harness.subscriptions.values()].map((subscription) => subscription.monitored.size),
+    [1000, 1]
+  );
+  assert.equal(harness.calls.add[0].points[0].deadbandType, 'none');
+  assert.equal(harness.calls.add[0].points[0].deadbandValue, 0);
+  assert.equal(harness.node.warnings.length, 1);
+  assert.match(harness.node.warnings[0], /Deadband was disabled/);
+  const status = harness.node.sent.at(-1).payload;
+  assert.deepEqual(status.compatibility, {
+    profile: 'siemens-wincc',
+    deadbandSupported: false,
+    monitoredItemsPerSubscription: 1000,
+  });
   await harness.close();
 });
 
@@ -454,4 +499,58 @@ test('value-only single output keeps scalar value and queue summary without poin
   assert.equal(harness.node.sent[0].opcua.queue.delivered, 1);
 
   await harness.close();
+});
+
+
+test('separate diagnostic port reports failure and inactivity without mixing status with data', async () => {
+  const harness = createHarness(2, { statusOutput: 'separate', outputMode: 'single' });
+  try {
+    await harness.input({ payload: [{ nodeId: 'ns=2;s=A' }] });
+    assert.equal(harness.node.sent.length, 0);
+    assert.equal(harness.node.diagnostics[0].payload.event, 'subscription_updated');
+    const record = [...harness.subscriptions.values()][0];
+    record.callback({ changes: [{ nodeId: 'ns=2;s=A', value: 42, statusCode: 'Good' }] });
+    assert.equal(harness.node.sent[0].payload, 42);
+    record.callback({ changes: [{ nodeId: 'ns=2;s=A', value: null, statusCode: 'BadNoCommunication' }] });
+    assert(harness.node.diagnostics.some((msg) => msg.payload.event === 'points_failed'));
+    harness.client.emit('state', { state: 'subscription-inactive', subscriptionId: record.id });
+    assert(harness.node.diagnostics.some((msg) => msg.payload.event === 'subscription_inactive'));
+  } finally { await harness.close(); }
+});
+
+test('legacy subscription status is retained and recovery also reaches output 2', async () => {
+  const harness = createHarness(2);
+  try {
+    await harness.input({ payload: [{ nodeId: 'ns=2;s=A' }] });
+    assert.equal(harness.node.sent[0].opcua.operation, 'subscription-status');
+    harness.subscriptions.clear();
+    harness.client.emit('state', { state: 'connected', sessionGeneration: 2 });
+    await wait(30);
+    const recovered = harness.node.diagnostics.find((msg) => msg.payload.event === 'subscription_restored');
+    assert.equal(recovered.payload.rebuilt, true);
+    assert.equal(recovered.payload.dataGapPossible, true);
+    assert(harness.node.sent.some((msg) => msg.opcua?.recovered));
+  } finally { await harness.close(); }
+});
+
+test('automatic subscription failures reach Catch once and re-arm after successful reconciliation', async (t) => {
+  const harness = createHarness(2, { nodeId: 'ns=2;s=A', reconnectInterval: 100 });
+  t.after(() => harness.close());
+  const originalCreate = harness.client.createSubscription;
+  harness.client.createSubscription = async () => { throw new Error('BadTimeout secret=private'); };
+  await wait(400);
+  assert.equal(harness.node.errors.length, 1);
+  assert.equal(harness.node.errors[0].error.code, 'BadTimeout');
+  assert.doesNotMatch(harness.node.errors[0].error.message, /private/);
+  assert.equal(harness.node.warnings.length, 0);
+  assert(harness.node.diagnostics.some(m => m.payload.event === 'subscription_startup_failed'));
+  assert(harness.node.diagnostics.some(m => m.payload.event === 'subscription_recovery_failed'));
+  harness.client.createSubscription = originalCreate;
+  await harness.input({ payload: [{ nodeId: 'ns=2;s=A' }] });
+  assert.equal(harness.node.monitored.size, 1);
+  harness.subscriptions.clear();
+  harness.client.createSubscription = async () => { throw new Error('BadTimeout'); };
+  harness.client.emit('state', { state: 'subscription-inactive' });
+  await wait(900);
+  assert.equal(harness.node.errors.length, 2);
 });

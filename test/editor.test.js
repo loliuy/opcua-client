@@ -107,6 +107,8 @@ test('Subscribe editor exposes automatic sharding and dual-threshold batching', 
   assert.match(html, /without rebuilding server subscriptions/);
   assert.match(html, /msg\.opcua\.identifiers/);
   assert.match(html, /one or more OPC UA subscriptions/);
+  assert.match(html, /Siemens WinCC Connection profile/);
+  assert.match(html, /unsupported Deadband filters are removed/);
 });
 
 test('Connection editor exposes a bounded native command queue', () => {
@@ -123,6 +125,10 @@ test('Connection editor exposes strict secure endpoint discovery and trust setti
   assert.match(html, /id="node-config-input-discoverEndpoints"/);
   assert.match(html, /id="node-config-input-testConnection"/);
   assert.match(html, /Basic256Sha256/);
+  assert.match(html, /Aes128_Sha256_RsaOaep/);
+  assert.match(html, /Aes256_Sha256_RsaPss/);
+  assert.match(html, /id="node-config-input-compatibilityProfile"/);
+  assert.match(html, /compatibilityProfile: \{ value: 'standard'/);
   assert.match(html, /id="node-config-input-certificate"/);
   assert.match(html, /id="node-config-input-privateKey"/);
   assert.match(html, /id="node-config-input-privateKeyPassword"/);
@@ -137,4 +143,5 @@ test('Connection editor exposes strict secure endpoint discovery and trust setti
   assert.match(html, /'trustedCertificate', true/);
   assert.match(html, /Runtime-visible paths may still be entered directly/);
   assert.match(html, /No endpoint advertises/);
+  assert.match(html, /Validity, key matching, RSA strength, and Application URI/);
 });
