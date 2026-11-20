@@ -104,7 +104,7 @@ test('uploads security files into Node-RED managed storage and cleans them on re
   await assert.rejects(() => fs.access(response.payload.file.path), /ENOENT/);
 });
 
-test('registers endpoint discovery and secure connection test routes', async () => {
+test('registers endpoint discovery and connection test routes', async () => {
   const harness = createHarness();
   let connectOptions;
   let disconnects = 0;
@@ -138,21 +138,14 @@ test('registers endpoint discovery and secure connection test routes', async () 
 
   const connection = await invoke(harness.routes.get('/opcua-client/test-connection'), {
     endpoint: 'opc.tcp://secure:4840',
-    securityMode: 'SignAndEncrypt',
-    securityPolicy: 'Basic256Sha256',
-    user: 'operator',
-    password: 'secret',
-    certificate: '/pki/client.der',
-    privateKey: '/pki/client-key.pem',
-    privateKeyPassword: 'key-secret',
-    trustedCertificates: '/pki/server.der\n/pki/ca.der',
+    securityMode: 'None',
+    securityPolicy: 'None',
+    compatibilityProfile: 'siemens-wincc',
   });
   assert.equal(connection.statusCode, 200);
   assert.equal(connection.payload.connected, true);
-  assert.equal(connectOptions.user, 'operator');
-  assert.equal(connectOptions.password, 'secret');
-  assert.equal(connectOptions.privateKeyPassword, 'key-secret');
-  assert.deepEqual(connectOptions.trustedCertificates, ['/pki/server.der', '/pki/ca.der']);
+  assert.equal(connectOptions.compatibilityProfile, 'siemens-wincc');
+  assert.deepEqual(connectOptions.securityPreflight, { enabled: false, policy: 'None' });
   assert.equal(disconnects, 1);
 });
 
@@ -185,8 +178,8 @@ test('one Connection config owns one client and equivalent configs are diagnosed
     allowParallelSession: false,
   });
   assert.match(second.warnings[0], /additional Session/);
-  assert.equal(first.client.listenerCount('fault'), 1);
-  assert.equal(second.client.listenerCount('fault'), 1);
+  assert.equal(first.client.listenerCount('fault'), 0);
+  assert.equal(second.client.listenerCount('fault'), 0);
 
   await first.client.connect();
   await first.client.connect();

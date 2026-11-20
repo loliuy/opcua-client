@@ -1,5 +1,7 @@
 'use strict';
 
+const { createDiagnostics } = require('../lib/diagnostics');
+
 const { chunks } = require('../lib/points');
 const { buildBrowseTree, selectedVariables } = require('../lib/browse-tree');
 
@@ -65,13 +67,20 @@ module.exports = function registerBrowseNode(RED) {
     RED.nodes.createNode(this, config);
     const node = this;
     node.connection = RED.nodes.getNode(config.connection);
+    const diagnostics = createDiagnostics(node, config, 'browse');
     const consumer = node.connection?.registerConsumer?.('browse', {
       nodeId: config.id, name: config.name,
     });
 
     node.on('input', async (msg, send, done) => {
-      if (!node.connection) return done(new Error('OPC UA connection not configured'));
+      if (!node.connection) {
+        const error = new Error('OPCUA_CONNECTION_NOT_CONFIGURED');
+        diagnostics.failure(error, send);
+        return done(error);
+      }
 
+      diagnostics.beginInput();
+      let inputError;
       try {
         consumer?.markUsed('browse');
         const rootNodeId = msg.nodeId || msg.topic || config.rootNodeId || 'ns=0;i=85';
@@ -124,6 +133,10 @@ module.exports = function registerBrowseNode(RED) {
         }
 
         const partial = browseDiagnostics?.truncated || browseDiagnostics?.failures?.length;
+        if (partial) diagnostics.emit('warn', 'browse_partial', 'OPC UA Browse returned partial results', {
+          failed: browseDiagnostics?.failures?.length || 0, total: points.length,
+          failures: browseDiagnostics?.failures || [],
+        }, send);
         node.status({
           fill: partial ? 'yellow' : 'green', shape: partial ? 'ring' : 'dot',
           text: `${points.length} points` +
@@ -132,8 +145,12 @@ module.exports = function registerBrowseNode(RED) {
         });
         done();
       } catch (error) {
+        inputError = error;
         node.status({ fill: 'red', shape: 'ring', text: error.message });
+        diagnostics.failure(error, send);
         done(error);
+      } finally {
+        diagnostics.endInput(inputError);
       }
     });
 

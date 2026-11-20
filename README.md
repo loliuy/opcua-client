@@ -178,19 +178,34 @@ finishes.
 
 Node editors show only the standard settings by default. Connection security/timeouts/cache, Browse limits/paging, Read/Write batching/output, and Subscribe queue/deadband tuning remain available under a closed **Advanced settings** section. Existing flows retain their stored advanced values.
 
+## Server compatibility profiles
+
+Connection nodes default to the standard OPC UA profile. Select **Siemens
+WinCC** for classic WinCC or Unified servers that do not advertise usable
+OperationLimits: Read, Write, and MonitoredItem service calls then use a
+conservative fallback of 200 items per request, while advertised non-zero
+server limits still take precedence. Subscribe nodes use at most 1000
+MonitoredItems per Subscription and remove Deadband filters because WinCC does
+not support `ModifyMonitoredItems`/Deadband behavior consistently. The selected
+profile and effective subscription behavior are included in status diagnostics.
+
 ## Secure connections
 
 Connection nodes support `None/None` and `Sign` or `SignAndEncrypt` with
-`Basic256Sha256`. Secure connections require a client certificate, its private
-key, and at least one trusted Server or CA certificate. Trust is strict: an
+`Basic256Sha256`, `Aes128_Sha256_RsaOaep`, or `Aes256_Sha256_RsaPss`. Secure
+connections require a client certificate, its private key, and at least one
+trusted Server or CA certificate. Trust is strict: an
 empty trust list is rejected instead of silently accepting every Server
 certificate. Optional CRL files can be supplied as a newline-separated list.
 Password-protected PEM private keys use the separate Node-RED credential field,
 so the password is not stored in the normal Flow configuration.
 
-The client Application URI can be configured when the URI embedded in the
-client certificate differs from the open62541 default. Username authentication
-uses the selected secure endpoint and its advertised UserTokenPolicy.
+Before opening the native client, the package checks certificate validity,
+certificate/private-key matching, RSA key type and minimum 2048-bit strength,
+trusted-certificate validity, and Application URI consistency. When the client
+certificate contains exactly one URI, leaving Application URI empty selects it
+automatically. Username authentication uses the selected secure endpoint and
+its advertised UserTokenPolicy.
 
 The Connection editor can call `GetEndpoints`, filters the response to the
 implemented policies, and selects an endpoint compatible with Anonymous or
@@ -212,7 +227,7 @@ Node-RED Alpine image, the pinned open62541 v1.4.16 source archive, and its
 not contact npm or GitHub and does not invoke a compiler:
 
 ```bash
-npm install ./tier0-opcua-client-0.5.0.tgz --offline
+npm install ./tier0-opcua-client-0.6.0.tgz --offline
 ```
 
 The loader uses the bundled native addon directly. Set
@@ -332,3 +347,68 @@ See [BENCHMARK.md](BENCHMARK.md) for the recorded 1,000, 5,000, 10,000, and sust
 - Native command queue: 256 pending commands per connection.
 
 Configured service batches are automatically clamped to the server's advertised OperationLimits.
+
+## Status and error output (0.6.1)
+
+Browse, Read, Write and Subscribe now have two outputs. Output 1 retains data;
+output 2 emits structured diagnostic messages. Connect output 2 to Debug, a
+JSON/file node or your logging service. The shared Connection configuration
+has no output ports: its state is reported by each referencing operation node,
+identified by nodeId and connectionId.
+
+诊断输出可独立接 Debug、JSON + File 或日志服务。payload.level 为 info / warn / error；
+连接断开、订阅无响应、恢复失败、点位 Bad 状态和队列丢数据都会输出对应事件。
+恢复成功也会输出 info，但连接恢复或订阅重建不代表已经收到新数据。
+
+Messages contain payload.level, event, message, time (ISO 8601), nodeId,
+connectionId, operation, retrying and optional statusCode/counts. Subscription
+recovery includes rebuilt and dataGapPossible. The envelope contains
+opcua.operation = "diagnostic". No input values, endpoint URLs, credentials,
+certificates or raw SDK error text are copied to this output.
+
+Background connection and subscription startup/recovery failures also call
+`node.error(error, msg)` on each affected operation node. Connect a Catch node
+in the same flow to Debug or your error-handling logic; scope Catch to the UA
+operation nodes as needed. The shared Connection configuration no longer emits
+duplicate state/fault warnings. A continuing background failure is reported to
+Catch once per operation node until recovery. Connection recovery re-arms
+connection errors; subscription errors require successful reconciliation.
+Failed input requests still call `done(error)` for each request, preserving the
+original message. A concurrent connection failure reported by that input does
+not also generate a background Catch error. Point-level non-Good results remain
+available on output 2; configuration advice and cleanup warnings remain warnings.
+
+Identical event/status-code pairs are emitted at most once per 30 seconds per
+node. The next emitted matching event includes suppressed repeats; there is
+no delayed timer flush. Connection restoration resets this suppression window.
+This 30-second limit applies only to diagnostic output; background Catch errors
+use the recovery-based rule above.
+
+For Subscribe, **Status messages → Both outputs (legacy compatible)** is the
+default: existing subscription-status messages remain on output 1 and the new
+structured events appear on output 2. Choose **Output 2 only** to keep output 1
+strictly for data. Existing Flow JSON without statusOutput keeps its old behavior;
+all existing wires on output 1 remain unchanged. New diagnostic events are not
+sent to output 1. Structured events contain summaries; existing detailed
+subscription-status payloads are preserved only in compatibility mode.
+
+This change adds reporting; it does not add a data-silence watchdog or change
+OPC UA reconnection/monitoring behavior.
+
+## Point failure details (0.6.2)
+
+Diagnostic output now includes payload.failures: an array of nodeId (OPC UA
+point identifier), optional alias, statusCode and a short explanation. The
+outer payload.nodeId still identifies the Node-RED flow node. Read/Write
+partial failures display yellow status with success/total and failure counts.
+The detail list is available even when data output is set to Value only.
+
+Each event includes at most 100 failed points; failed reports the full failure
+count, failuresTruncated indicates truncation, and omittedFailures reports the
+remaining count. Use Full metadata on output 1 for complete Read/Write results.
+Subscription compatibility output also retains its existing bounded failures.
+Duplicate event suppression compares the failing point identities and status
+codes so a different batch of failing points is not hidden by the first batch.
+No point values or raw input messages are copied. A whole-service exception
+without per-point results is still an operation failure: it cannot identify
+which individual points failed.

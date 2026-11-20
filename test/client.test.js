@@ -12,7 +12,7 @@ const { setAddonForTests, resetAddonForTests } = require('../lib/native');
 
 test.afterEach(() => resetAddonForTests());
 
-test('passes normalized secure connection options to the native addon', async () => {
+test('passes normalized connection and compatibility options to the native addon', async () => {
   let received;
   setAddonForTests({
     connectAsync: async (options) => {
@@ -22,17 +22,21 @@ test('passes normalized secure connection options to the native addon', async ()
     disconnectAsync: async () => {},
   });
   const client = new OpcUaClient({
-    endpoint: 'opc.tcp://secure:4840',
-    securityMode: 'SignAndEncrypt',
-    securityPolicy: 'Basic256Sha256',
-    certificate: '/pki/client.der',
-    privateKey: '/pki/client-key.pem',
-    trustedCertificates: '/pki/server.der\n/pki/ca.der',
+    endpoint: ' opc.tcp://server:4840 ',
+    securityMode: 'None',
+    securityPolicy: 'None',
+    compatibilityProfile: 'siemens-wincc',
   });
   await client.connect();
+  assert.equal(received.endpoint, 'opc.tcp://server:4840');
   assert.equal(received.securityPolicyUri,
-    'http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256');
-  assert.deepEqual(received.trustedCertificates, ['/pki/server.der', '/pki/ca.der']);
+    'http://opcfoundation.org/UA/SecurityPolicy#None');
+  assert.equal(received.compatibilityProfile, 'siemens-wincc');
+  assert.deepEqual(received.securityPreflight, { enabled: false, policy: 'None' });
+  assert.deepEqual(client.getDiagnostics().compatibility, {
+    profile: 'siemens-wincc',
+    requestBatchFallback: 200,
+  });
   await client.disconnect();
 });
 
@@ -186,6 +190,30 @@ test('clamps service batches to server operation limits', async () => {
   assert.deepEqual(monitoredBatches, [4, 4, 1]);
   assert.equal(effectiveBatchSize(200, 0), 200);
   assert.equal(effectiveBatchSize(200, undefined), 200);
+  assert.equal(effectiveBatchSize(500, 0, 200), 200);
+  await client.disconnect();
+});
+
+test('uses conservative Siemens service batches when OperationLimits are absent', async () => {
+  const readBatches = [];
+  setAddonForTests({
+    connectAsync: async () => 12,
+    getClientDiagnostics: () => ({ operationLimits: {}, nodeIdCache: {} }),
+    readManyAsync: async (_client, items) => {
+      readBatches.push(items.length);
+      return items;
+    },
+    disconnectAsync: async () => {},
+  });
+  const client = new OpcUaClient({
+    endpoint: 'opc.tcp://wincc:4862',
+    compatibilityProfile: 'siemens-wincc',
+  });
+  const points = Array.from({ length: 450 }, (_, index) => ({
+    nodeId: `ns=2;i=${index}`,
+  }));
+  await client.readMany(points, 500);
+  assert.deepEqual(readBatches, [200, 200, 50]);
   await client.disconnect();
 });
 

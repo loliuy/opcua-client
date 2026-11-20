@@ -47,6 +47,7 @@
     <div class="form-row"><label for="node-input-timestampMode">Timestamps</label><select id="node-input-timestampMode"><option value="source">Source</option><option value="both">Source and server</option><option value="server">Server</option><option value="neither">None</option></select></div>
     <div class="form-row"><label for="node-input-batchSize">Create batch size</label><input type="number" id="node-input-batchSize"></div>
     <div class="form-row"><label for="node-input-maxItemsPerSubscription">Items / subscription</label><input type="number" id="node-input-maxItemsPerSubscription"></div>
+    <div class="form-row"><label for="node-input-statusOutput">Status messages</label><select id="node-input-statusOutput"><option value="both">Both outputs (legacy compatible)</option><option value="separate">Output 2 only</option></select></div>
     <div class="form-row"><label for="node-input-outputMode">Change output</label><select id="node-input-outputMode"><option value="batch">Native batch</option><option value="single">One message per change</option></select></div>
     <div class="form-row"><label for="node-input-resultDetail">Result detail</label><select id="node-input-resultDetail"><option value="compact">Compact</option><option value="value">Value only</option><option value="full">Full metadata</option></select></div>
     <div class="form-row"><label for="node-input-callbackBatchSize">Output batch size</label><input type="number" id="node-input-callbackBatchSize"></div>
@@ -59,6 +60,7 @@
 </script>
 <script type="text/html" data-help-name="tier0-opcua-subscribe">
   <section lang="zh-CN">
+    <p>输出 2 为独立状态／异常消息：payload.level 为 info、warn 或 error。可连接 Debug、文件或日志服务；原有 Catch 和日志仍然有效。同类事件每 30 秒最多输出一次，下一次包含 suppressed 计数。输出不含原始值、凭据或完整错误文本。</p>
     <h3>订阅（Subscribe）</h3>
     <p>创建 OPC UA Subscription 和 MonitoredItems，由服务器在值变化时推送通知；它不是客户端定时 Read。大量点位会按照服务器限制自动拆分到多个 Subscription。</p>
     <h4>输入与命令</h4>
@@ -71,6 +73,7 @@
       <li>服务器可以把请求间隔修订为它支持的值。</li>
     </ul>
     <p>新节点默认 Server queue size=1、Discard oldest=true、Queue mode=latest，适合实时状态采集。脉冲、报警转换或完整历史不能丢失时，应改为 all 并增大服务器队列。</p>
+    <p>Connection 选择 Siemens WinCC 后，如果服务器没有公布有效限制，每个 Subscription 最多建立 1000 个 MonitoredItem，并自动移除 WinCC 不支持的 Deadband 配置；节点状态消息会报告实际兼容策略。</p>
     <h4>输出</h4>
     <ul>
       <li><b>Compact</b>：NodeId/alias、值、状态和源时间戳。</li>
@@ -81,6 +84,7 @@
   </section>
   <hr>
   <section lang="en">
+    <p>Output 2 emits status/error events with payload.level (info, warn, error). Connect it to Debug, file or logging nodes. Catch and existing logs remain supported. Repeats are limited to one per 30 seconds; the next matching event includes suppressed counts. Raw values, credentials and SDK error text are omitted.</p>
     <h3>Subscribe</h3>
     <p>Creates one or more OPC UA subscriptions and MonitoredItems so the server sends data-change notifications. It is not a periodic client Read. Large point sets are automatically sharded across Subscriptions according to server limits.</p>
     <h4>Input and commands</h4>
@@ -93,6 +97,7 @@
       <li>The server may revise requested intervals to supported values.</li>
     </ul>
     <p>New nodes default to server queue size 1, discard-oldest, and local latest coalescing for real-time state. Select all and increase the server queue for pulses, alarm transitions, or history where every change must be retained.</p>
+    <p>With the Siemens WinCC Connection profile, each Subscription is conservatively capped at 1000 MonitoredItems when the server advertises no usable limit, and unsupported Deadband filters are removed automatically. Status output reports the active compatibility behavior.</p>
     <h4>Output</h4>
     <ul>
       <li><b>Compact</b>: NodeId/alias, value, status, and source timestamp.</li>
@@ -104,8 +109,9 @@
 </script>
 <script type="text/javascript">
   RED.nodes.registerType('tier0-opcua-subscribe', {
-    category: 'OPC UA', color: '#c7e9f1', inputs: 1, outputs: 1, icon: 'bridge.png',
+    category: 'OPC UA', color: '#c7e9f1', inputs: 1, outputs: 2, outputLabels: ['Data', 'Status / errors'], icon: 'font-awesome/fa-rss',
     defaults: {
+      statusOutput: { value: 'both' },
       connection: { value: '', type: 'tier0-opcua-connection', required: true },
       nodeId: { value: '' }, pointList: { value: '' }, pointListFileName: { value: '' },
       publishingInterval: { value: 1000, validate: RED.validators.number() }, samplingInterval: { value: 1000, validate: RED.validators.number() },

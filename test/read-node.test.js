@@ -7,7 +7,7 @@ const registerReadNode = require('../nodes/read');
 
 function createHarness(config = {}) {
   const diagnostics = { commandQueue: { depth: 0 } };
-  const client = {
+  const client = Object.assign(new EventEmitter(), {
     async readMany(points) {
       return points.map((point, index) => ({
         nodeId: point.nodeId,
@@ -19,7 +19,7 @@ function createHarness(config = {}) {
       }));
     },
     getDiagnostics: () => diagnostics,
-  };
+  });
   const connection = { client, getDiagnostics: () => diagnostics };
   let Constructor;
   const RED = {
@@ -29,6 +29,8 @@ function createHarness(config = {}) {
         node.on = emitter.on.bind(emitter);
         node.emit = emitter.emit.bind(emitter);
         node.status = () => {};
+        node.errors = [];
+        node.error = (error, msg) => node.errors.push({ error, msg });
       },
       getNode: () => connection,
       registerType(name, constructor) {
@@ -55,7 +57,7 @@ function createHarness(config = {}) {
     });
   }
 
-  return { diagnostics, input, sent };
+  return { diagnostics, input, sent, client, node };
 }
 
 const detailedPoints = [
@@ -136,4 +138,55 @@ test('legacy nodes without resultDetail preserve full metadata and diagnostics',
   assert.equal(harness.sent[0].payload[0].serverTimestamp, '2026-08-20T00:00:10.000Z');
   assert.equal(harness.sent[0].opcua.resultDetail, 'full');
   assert.equal(harness.sent[0].opcua.clientDiagnostics, harness.diagnostics);
+});
+
+
+test('value-only reads still identify inaccessible points on port 2 and show partial failure', async () => {
+  const harness = createHarness({ resultDetail: 'value', pointList: JSON.stringify(detailedPoints) });
+  harness.client.readMany = async () => [
+    { nodeId: detailedPoints[0].nodeId, value: null, statusCode: 'BadNotReadable' },
+    { nodeId: detailedPoints[1].nodeId, value: 42, statusCode: 'Good' },
+  ];
+  let status;
+  harness.node.status = (value) => { status = value; };
+  await harness.input({ payload: 'trigger' });
+  const diagnostic = harness.sent.find(Array.isArray)[1].payload;
+  assert.equal(diagnostic.failures[0].nodeId, detailedPoints[0].nodeId);
+  assert.equal(diagnostic.failures[0].alias, 'point-a');
+  assert.equal(diagnostic.failures[0].statusCode, 'BadNotReadable');
+  assert.equal(status.fill, 'yellow');
+  assert.match(status.text, /1\/2 read.*1 failed/);
+  assert.deepEqual(harness.sent.find((msg) => !Array.isArray(msg)).payload, [null, 42]);
+});
+
+test('a failed input owns its Catch error even when the connection also emits a fault', async () => {
+  const harness = createHarness({ nodeId: 'ns=2;s=A' });
+  const fault = new Error('BadConnectionRejected');
+  harness.client.readMany = async () => {
+    harness.client.emit('state', { state: 'failed', statusCode: 'BadConnectionRejected' });
+    harness.client.emit('fault', fault);
+    throw fault;
+  };
+  await assert.rejects(harness.input({ payload: 'trigger' }), fault);
+  assert.equal(harness.node.errors.length, 0, 'done(error) reports the input failure');
+  harness.client.emit('fault', fault);
+  assert.equal(harness.node.errors.length, 0, 'retry stays in the reported outage');
+  await assert.rejects(harness.input({ payload: 'next trigger' }), fault);
+  harness.client.emit('state', { state: 'connected' });
+  harness.client.emit('fault', fault);
+  assert.equal(harness.node.errors.length, 1, 'a new background outage reaches Catch');
+  harness.node.emit('close');
+});
+
+test('a successful input does not swallow a concurrent background connection failure', async () => {
+  const harness = createHarness({ nodeId: 'ns=2;s=A' });
+  const readMany = harness.client.readMany;
+  harness.client.readMany = async (points) => {
+    harness.client.emit('fault', new Error('BadConnectionRejected'));
+    return readMany(points);
+  };
+  await harness.input({ payload: 'trigger' });
+  assert.equal(harness.node.errors.length, 1);
+  assert.equal(harness.node.errors[0].error.code, 'BadConnectionRejected');
+  harness.node.emit('close');
 });

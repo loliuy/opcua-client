@@ -15,11 +15,13 @@
   <div class="form-row"><label></label><button type="button" class="red-ui-button" id="node-config-input-discoverEndpoints">Discover endpoints</button> <button type="button" class="red-ui-button" id="node-config-input-testConnection">Test connection</button></div>
   <div class="opcua-discovery-result" id="node-config-input-discoveryResult" style="display:none"><select id="node-config-input-discoveredEndpoint"></select></div>
   <div class="opcua-standard-note" id="node-config-input-testResult"></div>
+  <div class="form-row"><label for="node-config-input-compatibilityProfile">Server profile</label><select id="node-config-input-compatibilityProfile"><option value="standard">Standard OPC UA</option><option value="siemens-wincc">Siemens WinCC</option></select></div>
+  <div class="opcua-standard-note">Siemens WinCC uses conservative 200-item service batches and disables unsupported Subscription Deadband filters when the Server does not advertise usable limits.</div>
   <div class="form-row"><label for="node-config-input-securityMode">Security</label><select id="node-config-input-securityMode"><option value="None">None</option><option value="Sign">Sign</option><option value="SignAndEncrypt">SignAndEncrypt</option></select></div>
   <div class="opcua-standard-note">Standard defaults include automatic reconnect, connectivity checks, and bounded command/NodeId queues.</div>
   <details class="opcua-advanced">
     <summary>Security and advanced connection settings</summary>
-    <div class="form-row"><label for="node-config-input-securityPolicy">Policy</label><select id="node-config-input-securityPolicy"><option value="None">None</option><option value="Basic256Sha256">Basic256Sha256</option></select></div>
+    <div class="form-row"><label for="node-config-input-securityPolicy">Policy</label><select id="node-config-input-securityPolicy"><option value="None">None</option><option value="Basic256Sha256">Basic256Sha256</option><option value="Aes128_Sha256_RsaOaep">Aes128_Sha256_RsaOaep</option><option value="Aes256_Sha256_RsaPss">Aes256_Sha256_RsaPss</option></select></div>
     <div class="form-row"><label for="node-config-input-user">User</label><input type="text" id="node-config-input-user"></div>
     <div class="form-row"><label for="node-config-input-password">Password</label><input type="password" id="node-config-input-password"></div>
     <div class="form-row opcua-secure-field"><label for="node-config-input-certificate">Client certificate</label><input type="text" class="opcua-security-path" id="node-config-input-certificate" placeholder="Upload or enter /path/to/client.der"> <button type="button" class="red-ui-button" id="node-config-upload-certificate"><i class="fa fa-upload"></i> Upload</button><input type="file" class="opcua-hidden-file" id="node-config-file-certificate" accept=".der,.pem,.crt,.cer"></div>
@@ -50,8 +52,9 @@
       <li><b>Endpoint</b>：服务器地址，例如 <code>opc.tcp://192.168.1.10:4840</code>。</li>
       <li><b>Discover endpoints</b>：读取服务器公开的安全模式、安全策略和用户认证方式。</li>
       <li><b>Test connection</b>：使用当前配置建立临时连接并验证认证。</li>
-      <li><b>Security</b>：支持 None、Sign、SignAndEncrypt；安全模式、策略和认证方式必须与服务器 Endpoint 匹配。</li>
-      <li><b>证书</b>：安全连接可上传或指定客户端证书、私钥、信任证书和 CRL。Application URI 应与客户端证书一致。</li>
+      <li><b>Server profile</b>：默认使用标准 OPC UA 行为；Siemens WinCC 模式在服务器未公布有效 OperationLimits 时按每批 200 点请求，并在订阅中禁用 WinCC 不支持的 Deadband。</li>
+      <li><b>Security</b>：支持 None、Sign、SignAndEncrypt，以及 Basic256Sha256、Aes128_Sha256_RsaOaep、Aes256_Sha256_RsaPss；安全模式、策略和认证方式必须与服务器 Endpoint 匹配。</li>
+      <li><b>证书</b>：安全连接可上传或指定客户端证书、私钥、信任证书和 CRL。连接前会检查有效期、证书和私钥是否匹配、RSA 密钥强度及 Application URI。若证书只包含一个 URI，可留空并自动采用。</li>
     </ul>
     <h4>建议</h4>
     <p>一个 Connection 配置对应一条客户端 Session。多个业务节点应复用同一个 Connection，避免为相同 Endpoint 重复创建 Session。节点内置自动重连、连通性检查以及有界命令队列。</p>
@@ -65,8 +68,9 @@
       <li><b>Endpoint</b>: Server URL, for example <code>opc.tcp://192.168.1.10:4840</code>.</li>
       <li><b>Discover endpoints</b>: Reads advertised security modes, policies, and user token types.</li>
       <li><b>Test connection</b>: Opens a temporary connection with the current settings and validates authentication.</li>
-      <li><b>Security</b>: Supports None, Sign, and SignAndEncrypt. Mode, policy, and identity must match an advertised endpoint.</li>
-      <li><b>Certificates</b>: Secure connections can upload or reference a client certificate, private key, trust list, and CRLs. The Application URI should match the client certificate.</li>
+      <li><b>Server profile</b>: Standard uses normal OPC UA behavior. Siemens WinCC falls back to 200-item service batches when usable OperationLimits are not advertised and removes unsupported Subscription Deadband filters.</li>
+      <li><b>Security</b>: Supports None, Sign, and SignAndEncrypt with Basic256Sha256, Aes128_Sha256_RsaOaep, or Aes256_Sha256_RsaPss. Mode, policy, and identity must match an advertised endpoint.</li>
+      <li><b>Certificates</b>: Secure connections can upload or reference a client certificate, private key, trust list, and CRLs. Validity, key matching, RSA strength, and Application URI are checked before connecting. An empty URI is filled automatically when the certificate contains exactly one URI.</li>
     </ul>
     <h4>Recommendation</h4>
     <p>One Connection configuration owns one client Session. Reuse it across nodes targeting the same server instead of creating duplicate Sessions. Automatic reconnect, connectivity checks, and a bounded command queue are enabled.</p>
@@ -78,6 +82,7 @@
     defaults: {
       endpoint: { value: '', required: true },
       securityMode: { value: 'None' }, securityPolicy: { value: 'None' },
+      compatibilityProfile: { value: 'standard' },
       user: { value: '' }, certificate: { value: '' }, privateKey: { value: '' },
       applicationUri: { value: '' }, trustedCertificates: { value: '' }, revocationList: { value: '' },
       requestedSessionTimeout: { value: 60000, validate: RED.validators.number() },
@@ -207,6 +212,7 @@
           endpoint: String($('#node-config-input-endpoint').val() || '').trim(),
           securityMode: mode.val(),
           securityPolicy: policy.val(),
+          compatibilityProfile: $('#node-config-input-compatibilityProfile').val(),
           user: $('#node-config-input-user').val(),
           password: $('#node-config-input-password').val(),
           certificate: $('#node-config-input-certificate').val(),
@@ -245,9 +251,12 @@
           const allEndpoints = Array.isArray(response.endpoints) ? response.endpoints : [];
           const identityType = String($('#node-config-input-user').val() || '').trim()
             ? 'Username' : 'Anonymous';
+          const supportedPolicies = new Set([
+            'None', 'Basic256Sha256',
+            'Aes128_Sha256_RsaOaep', 'Aes256_Sha256_RsaPss',
+          ]);
           const supported = allEndpoints.filter(function (item) {
-            const itemPolicy = policyName(item.securityPolicyUri);
-            return itemPolicy === 'None' || itemPolicy === 'Basic256Sha256';
+            return supportedPolicies.has(policyName(item.securityPolicyUri));
           });
           const matchingIdentity = supported.filter(function (item) {
             return (item.userIdentityTokens || []).some(function (token) {
@@ -271,7 +280,7 @@
               .appendTo(discovered);
           });
           if (!endpoints.length) {
-            RED.notify('The server returned no supported None or Basic256Sha256 endpoint', 'warning');
+            RED.notify('The server returned no endpoint supported by this client', 'warning');
             result.hide();
             return;
           }
@@ -293,7 +302,8 @@
         if (!selected) return;
         const selectedPolicy = policyName(selected.securityPolicyUri);
         mode.val(selected.securityMode);
-        if (selectedPolicy === 'None' || selectedPolicy === 'Basic256Sha256') {
+        if (['None', 'Basic256Sha256', 'Aes128_Sha256_RsaOaep',
+          'Aes256_Sha256_RsaPss'].includes(selectedPolicy)) {
           policy.val(selectedPolicy);
         }
         updateSecurityFields();
