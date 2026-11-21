@@ -1,5 +1,67 @@
 # OPC UA client benchmark
 
+## Slow periodic reads — 2026-11-21
+
+The polling regression uses the real Read node handler, `OpcUaClient`, native
+open62541 addon, and a Python OPC UA server. Only the Node-RED event delivery is
+a test harness; this is not a full deployed Node-RED Catch-node test. The server
+delays every point-read service by 50 ms. Each round reads 1,000 points in ten
+100-point batches. The overload comparison triggers every 100 ms; a third
+run increases the interval to 1,000 ms. All runs retain the normal
+10-second request timeout and native command queue capacity of 256.
+
+| Policy | Interval | Triggers | Completed rounds | Skipped ticks | Maximum concurrent rounds | Round P95 | Maximum native queue depth |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Default `all` | 100 ms | 20 | 20 | 0 | 20 | 10,898 ms | 4 |
+| `skip-while-busy` | 100 ms | 600 | 75 | 525 | 1 | 780 ms | 1 |
+| `skip-while-busy` | 1,000 ms | 10 | 10 | 0 | 1 | 780 ms | 1 |
+
+The default run dispatched its triggers in 2.024 seconds but took 12.569 seconds
+to drain. The protected overload run dispatched continuously for 60.232 seconds and
+kept producing complete, validated 1,000-point results. Reported skipped counts
+accounted for all 525 discarded ticks. None of the runs had native queue
+rejections or queued-command timeouts. The sample sizes differ to avoid running the
+unprotected overload for a full minute; these are backlog/latency observations,
+not a claim that the device's raw throughput increased.
+
+With the same server and point load but a 1,000 ms interval, all ten triggers
+completed in a 10.010-second run with zero skips. Skipping is an overload
+safeguard; matching the interval to actual capacity removes the need to skip.
+The tested 1,000 ms is specific to this fixture, not a recommended constant
+for every field server.
+
+Whole-round latency can exceed the request timeout without a service timeout:
+some waiting occurs before the native queue, and a round includes many service
+requests. Native queue depth alone does not measure total polling backlog.
+
+The fixture also returns a real UA ServiceFault with `BadTimeout`. The protected
+Read reports `Batch read failed: BadTimeout` through `done(error)` and output 2,
+then successfully reads on the next trigger. Skipping excess ticks does not
+hide actual UA failures and is not proof that every field timeout is caused by
+polling overlap.
+
+Reproduce with a matching platform addon and Python `opcua` installed, using
+two terminals:
+
+```bash
+python3 test/fixture/polling_server.py 4860 1000
+OPCUA_POLLING_ENDPOINT=opc.tcp://127.0.0.1:4860 npm run test:read-polling
+```
+
+The recorded run used Docker's Node 22.23.5 Alpine runtime with the bundled musl
+addon and a Windows-host Python 3.10.20 / opcua 0.98.13 fixture via
+`host.docker.internal`. Keep the
+fixture on a local test network. Its writable delay/failure controls are test
+fixtures, not production behavior.
+
+Design references: [S7's single active round and deferred-cycle merging](https://github.com/st-one-io/node-red-contrib-s7/blob/29b6b1feb9f5bf929983b052d0e1c4d9e3eaf42f/red/s7.js#L276-L312)
+and [Modbus's bounded request queue](https://github.com/BiancoRoyal/node-red-contrib-modbus/blob/af0426f5adac1ed1d6652b3916d926a83724fb17/src/core/modbus-queue-core.js#L190-L222).
+Tier0 skips redundant timer ticks until the next period instead of immediately
+running a deferred cycle. The policy is explicit and limited to fixed periodic
+sampling; legacy flows continue to process every input.
+
+## Earlier throughput baseline
+
 Recorded on 2026-08-05 in the Node-RED 4.1.2 container used for development, with Node.js 20.19.6, open62541 1.4.16, security mode `None`, and a Python OPC UA server running in the same container over loopback.
 
 The benchmark uses real OPC UA service calls. It browses every variable, reads and writes the full point set in batches of 500, creates one Subscription containing all MonitoredItems, waits for the final value of every point, and removes all MonitoredItems during cleanup.
