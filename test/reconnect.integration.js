@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const net = require('node:net');
 const path = require('node:path');
 const { once } = require('node:events');
 const { spawn } = require('node:child_process');
@@ -51,7 +52,45 @@ async function waitFor(predicate, timeoutMs, description) {
   throw new Error(`Timed out waiting for ${description}`);
 }
 
+async function verifyHandshakeBackoff() {
+  const acceptedAt = [];
+  const sockets = new Set();
+  const peer = net.createServer(socket => {
+    acceptedAt.push(performance.now());
+    sockets.add(socket);
+    socket.on('error', () => {});
+    socket.on('close', () => sockets.delete(socket));
+    // Refuse the first two handshakes. Hold any extra socket until timeout
+    // so a regression cannot spin indefinitely on this fixture.
+    if (acceptedAt.length <= 2) socket.once('data', () => socket.end());
+  });
+  peer.listen(0, '127.0.0.1');
+  await once(peer, 'listening');
+  const client = new OpcUaClient({
+    endpoint: `opc.tcp://127.0.0.1:${peer.address().port}`,
+    requestTimeout: 1000, reconnectInterval: 500, maxReconnectInterval: 500,
+  });
+  const delays = [];
+  client.on('state', state => {
+    if (state.state === 'backoff') delays.push(state.delay);
+  });
+  try {
+    await assert.rejects(client.connect());
+    assert.equal(acceptedAt.length, 1, 'a failed handshake must not open another socket');
+    await waitFor(() => delays.length >= 2, 5000, 'second failed handshake');
+    assert.equal(acceptedAt.length, 2);
+    const gap = acceptedAt[1] - acceptedAt[0];
+    assert.ok(gap >= delays[0] - 2, `TCP retry after ${gap}ms, scheduled ${delays[0]}ms`);
+    console.log(JSON.stringify({ handshakeConnections: acceptedAt.length, scheduledMs: delays[0], gapMs: Math.round(gap) }));
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await client.disconnect();
+    await new Promise(resolve => peer.close(resolve));
+  }
+}
+
 async function main() {
+  await verifyHandshakeBackoff();
   let server = await startFixture();
   let client;
   let subscriptionId;

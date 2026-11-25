@@ -66,6 +66,29 @@ async function removeNode(node) {
   await new Promise((resolve) => node.emit('close', true, resolve));
 }
 
+test('disabling the last consumer cancels retry until acquisition resumes', async () => {
+  let attempts = 0;
+  setAddonForTests({
+    connectAsync: async () => {
+      attempts++;
+      if (attempts === 1) throw new Error('BadTooManyOperations');
+      return 7;
+    },
+    disconnectAsync: async () => {},
+  });
+  const { Constructor } = createHarness();
+  const node = new Constructor({ endpoint: 'opc.tcp://test:4840', reconnectInterval: 100, maxReconnectInterval: 100 });
+  const consumer = node.registerConsumer('read');
+  await assert.rejects(node.client.connect(), /BadTooManyOperations/);
+  await consumer.release();
+  await new Promise(resolve => setTimeout(resolve, 220));
+  assert.equal(attempts, 1);
+  const enabled = node.registerConsumer('read');
+  assert.equal(await node.client.connect(), 7);
+  await enabled.release();
+  await closeNode(node);
+});
+
 test('uploads security files into Node-RED managed storage and cleans them on removal', async (t) => {
   const userDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tier0-opcua-route-'));
   t.after(() => fs.rm(userDir, { recursive: true, force: true }));
@@ -258,7 +281,7 @@ test('waits for dependent resource cleanup before disconnecting the shared clien
   assert.equal(cleanupRuns, 1);
 });
 
-test('reports consumer references and last use without automatic idle disconnect', async () => {
+test('reports consumer references and disconnects only after the last release', async () => {
   const harness = createHarness();
   setAddonForTests({ disconnectAsync: async () => {} });
   const node = new harness.Constructor({
@@ -288,7 +311,7 @@ test('reports consumer references and last use without automatic idle disconnect
     idleMs: null,
     totalOperations: 0,
     operations: {},
-    automaticIdleDisconnect: false,
+    automaticIdleDisconnect: true,
   });
 
   read.markUsed('read');
@@ -300,10 +323,14 @@ test('reports consumer references and last use without automatic idle disconnect
   assert.match(used.lastUsedAt, /^\d{4}-\d{2}-\d{2}T/);
   assert(used.idleMs >= 0);
 
+  const original = node.client;
   read.release();
   read.release();
-  subscribe.release();
+  assert.equal(node.client, original);
+  await subscribe.release();
+  assert.equal(original.closed, true);
+  assert.notEqual(node.client, original);
   assert.equal(node.getConnectionUsage().consumerCount, 0);
-  assert.equal(node.getConnectionUsage().automaticIdleDisconnect, false);
+  assert.equal(node.getConnectionUsage().automaticIdleDisconnect, true);
   await closeNode(node);
 });

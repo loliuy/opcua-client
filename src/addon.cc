@@ -3,6 +3,7 @@
 #include <open62541/client.h>
 #include <open62541/client_config_default.h>
 #include <open62541/client_highlevel.h>
+#include <open62541/client_highlevel_async.h>
 #include <open62541/client_subscriptions.h>
 #include <open62541/nodeids.h>
 
@@ -593,6 +594,7 @@ struct ClientContext {
   std::atomic<uint64_t> reconnect_count{0};
   std::atomic<uint64_t> disconnect_count{0};
   std::atomic<uint64_t> session_generation{0};
+  std::atomic<uint32_t> next_cancel_handle{1};
 };
 
 #ifdef UA_ENABLE_ENCRYPTION
@@ -685,6 +687,12 @@ void ClientStateChanged(UA_Client* client, UA_SecureChannelState channel_state,
   bool now_connected = channel_state == UA_SECURECHANNELSTATE_OPEN &&
                        session_state == UA_SESSIONSTATE_ACTIVATED &&
                        UA_StatusCode_isGood(connect_status);
+  // A peer closing the socket mid-handshake must return control to the
+  // supervisor's backoff. Keep SDK-directed channel switches during discovery
+  // (CLOSING) and recovery of an activated session available.
+  UA_Client_getConfig(client)->noReconnect =
+      channel_state >= UA_SECURECHANNELSTATE_CONNECTED &&
+      channel_state <= UA_SECURECHANNELSTATE_OPEN && !now_connected;
   bool was_connected = context->connected.exchange(now_connected);
   if (was_connected && !now_connected) context->disconnect_count.fetch_add(1);
   if (now_connected && !was_connected) {
@@ -725,7 +733,6 @@ void ClientInactivity(UA_Client* client) {
 void SubscriptionInactivity(UA_Client* client, UA_UInt32 subscription_id, void*) {
   auto* context = static_cast<ClientContext*>(UA_Client_getContext(client));
   if (!context) return;
-  context->force_secure_channel_reconnect.store(true);
   auto event = std::make_unique<ClientStateEvent>();
   event->state = "subscription-inactive";
   event->reason = "publish-timeout";
@@ -884,6 +891,7 @@ void RejectPendingClientCommands(ClientContext* context, const std::string& reas
 
 void DrainClientCommands(ClientContext* context, size_t maximum) {
   for (size_t index = 0; index < maximum; ++index) {
+    if (!context->running.load() || context->force_secure_channel_reconnect.load()) return;
     std::shared_ptr<ClientCommand> command;
     {
       std::lock_guard<std::mutex> lock(context->command_mutex);
@@ -906,7 +914,7 @@ void DrainClientCommands(ClientContext* context, size_t maximum) {
       context->commands_rejected.fetch_add(1);
       CompleteClientCommand(command, "OPC UA client command failed unexpectedly");
     }
-    if (!context->running.load()) return;
+    if (!context->running.load() || context->force_secure_channel_reconnect.load()) return;
   }
 }
 
@@ -916,6 +924,7 @@ void Iterate(ClientContext* context) {
     if (context->client) {
       UA_Client_run_iterate(context->client, 20);
       if (context->force_secure_channel_reconnect.exchange(false)) {
+        RejectPendingClientCommands(context, "OPC UA client reconnecting");
         UA_Client_disconnectSecureChannelAsync(context->client);
       }
       if (context->refresh_operation_limits.exchange(false) &&
@@ -1469,8 +1478,20 @@ class ReadManyWorker : public ClientCommandWorker {
       }
     }
     if (!context_->client) { UA_ReadRequest_clear(&request); SetError("Client disconnected"); return; }
+    // Keep manual requestHandles in [1, 99999] to avoid clashing with open62541's >100,000 handles.
+    const uint32_t request_handle = (context_->next_cancel_handle.fetch_add(1) % 99999U) + 1U;
+    request.requestHeader.requestHandle = request_handle;
     response_ = UA_Client_Service_read(context_->client, request);
     UA_ReadRequest_clear(&request);
+    if (response_.responseHeader.serviceResult == UA_STATUSCODE_BADTIMEOUT &&
+        context_->client && context_->connected.load()) {
+      UA_CancelRequest cancel_request;
+      UA_CancelRequest_init(&cancel_request);
+      cancel_request.requestHandle = request_handle;
+      __UA_Client_AsyncService(
+          context_->client, &cancel_request, &UA_TYPES[UA_TYPES_CANCELREQUEST],
+          nullptr, &UA_TYPES[UA_TYPES_CANCELRESPONSE], nullptr, nullptr);
+    }
     if (!UA_StatusCode_isGood(response_.responseHeader.serviceResult)) {
       SetError("Batch read failed: " + StatusName(response_.responseHeader.serviceResult));
     }
@@ -2129,7 +2150,20 @@ class DeleteSubscriptionWorker : public ClientCommandWorker {
  public:
   DeleteSubscriptionWorker(Napi::Promise::Deferred deferred, std::shared_ptr<ClientContext> context, uint32_t id)
       : ClientCommandWorker(deferred, std::move(context)), id_(id) {}
-  void ExecuteClientCommand() override { auto found = context_->subscriptions.find(id_); if (found == context_->subscriptions.end()) return; status_ = context_->client ? UA_Client_Subscriptions_deleteSingle(context_->client, id_) : UA_STATUSCODE_BADCONNECTIONCLOSED; CloseNotificationQueue(found->second->notifications); context_->subscriptions.erase(found); if (!UA_StatusCode_isGood(status_)) SetError("Delete subscription failed: " + StatusName(status_)); }
+  void ExecuteClientCommand() override {
+    auto found = context_->subscriptions.find(id_);
+    if (found == context_->subscriptions.end()) return;
+    status_ = context_->client ? UA_Client_Subscriptions_deleteSingle(context_->client, id_)
+                               : UA_STATUSCODE_BADCONNECTIONCLOSED;
+    if (!UA_StatusCode_isGood(status_) &&
+        status_ != UA_STATUSCODE_BADSUBSCRIPTIONIDINVALID &&
+        status_ != UA_STATUSCODE_BADNOSUBSCRIPTION) {
+      SetError("Delete subscription failed: " + StatusName(status_));
+      return;
+    }
+    CloseNotificationQueue(found->second->notifications);
+    context_->subscriptions.erase(found);
+  }
   void OnOK() override { Napi::Object result = Napi::Object::New(Env()); result.Set("subscriptionId", id_); result.Set("statusCode", StatusName(status_)); deferred_.Resolve(result); }
  private:
   uint32_t id_; UA_StatusCode status_ = UA_STATUSCODE_GOOD;

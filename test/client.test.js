@@ -259,6 +259,84 @@ test('keeps the native handle during recoverable reconnect and resumes on activa
   assert.equal(disconnects, 1);
 });
 
+test('ignores stale handshake state callbacks arriving after connect resolves', async () => {
+  let stateCallback;
+  setAddonForTests({
+    connectAsync: async (_options, callback) => {
+      stateCallback = callback;
+      return 22;
+    },
+    readManyAsync: async (_client, items) => items,
+    getClientDiagnostics: () => ({
+      connection: { state: 'connected', connected: true, stateSequence: 4, sessionGeneration: 1 },
+      operationLimits: {},
+      nodeIdCache: {},
+    }),
+    disconnectAsync: async () => {},
+  });
+  const client = new OpcUaClient({ endpoint: 'opc.tcp://test:4840' });
+  await client.connect();
+  // Late TSFN events from the initial handshake must not downgrade connected state.
+  stateCallback({
+    state: 'reconnecting', connected: false, recoverable: true,
+    terminal: false, statusCode: 'Good', sequence: 2, sessionGeneration: 0,
+  });
+  assert.equal(client.getState().state, 'connected');
+  assert.deepEqual(await client.readMany([{ nodeId: 'ns=2;i=1' }]), [{ nodeId: 'ns=2;i=1' }]);
+
+  // A newer sequence after connect is still honored.
+  stateCallback({
+    state: 'reconnecting', connected: false, recoverable: true,
+    terminal: false, statusCode: 'Good', sequence: 5, sessionGeneration: 1,
+  });
+  assert.equal(client.getState().state, 'reconnecting');
+  await client.disconnect();
+});
+
+test('polling and subscription retries respect a pending reconnect and resume after recovery', async (t) => {
+  let attempts = 0;
+  setAddonForTests({
+    connectAsync: async () => {
+      attempts += 1;
+      if (attempts <= 2) throw new Error('BadTooManyOperations');
+      return 7;
+    },
+    readManyAsync: async (_handle, items) => items,
+    createSubscriptionAsync: async () => 42,
+    disconnectAsync: async () => {},
+  });
+  t.mock.method(Math, 'random', () => 0.75);
+  const client = new OpcUaClient({
+    endpoint: 'opc.tcp://test:4840', reconnectInterval: 100, maxReconnectInterval: 150,
+  });
+  const points = [{ nodeId: 'ns=2;i=1' }];
+  const backoffs = [];
+  const waitingCalls = [];
+  const connected = new Promise((resolve) => {
+    client.on('state', (state) => {
+      if (state.connected) resolve();
+      if (state.state !== 'backoff') return;
+      backoffs.push(state.delay);
+      for (let i = 0; i < 5; i += 1) {
+        waitingCalls.push(Promise.allSettled([
+          client.readMany(points), client.createSubscription({}, () => {}),
+        ]));
+      }
+    });
+  });
+  await assert.rejects(client.connect(), /BadTooManyOperations/);
+  await connected;
+  assert.deepEqual(backoffs, [110, 150]);
+  assert.equal(attempts, 3);
+  for (const result of (await Promise.all(waitingCalls)).flat()) {
+    assert.equal(result.reason?.code, 'OPCUA_RECONNECTING');
+  }
+  assert.deepEqual(await client.readMany(points), points);
+  assert.equal(await client.createSubscription({}, () => {}), 42);
+  assert.equal(attempts, 3);
+  await client.disconnect();
+});
+
 test('replaces a terminal native client and reconnects with bounded backoff', async () => {
   const callbacks = [];
   let connectCalls = 0;

@@ -37,8 +37,9 @@ module.exports = function registerBrowseNode(RED) {
       }
 
       activeEditorBrowses.add(connectionId);
+      const consumer = connection.registerConsumer?.('editor-browse');
       try {
-        connection.markUsed?.('editor-browse');
+        consumer?.markUsed('editor-browse');
         const items = await connection.client.browse({
           rootNodeId,
           recursive: true,
@@ -58,6 +59,7 @@ module.exports = function registerBrowseNode(RED) {
         const status = error?.code === 'OPCUA_RECONNECTING' ? 503 : 500;
         res.status(status).send({ error: error.message || String(error) });
       } finally {
+        await consumer?.release();
         activeEditorBrowses.delete(connectionId);
       }
     }
@@ -154,9 +156,9 @@ module.exports = function registerBrowseNode(RED) {
       }
     });
 
-    node.on('close', (removed, done) => {
+    node.on('close', async (removed, done) => {
       if (typeof removed === 'function') done = removed;
-      consumer?.release();
+      await consumer?.release();
       done?.();
     });
   }

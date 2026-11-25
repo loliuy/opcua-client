@@ -380,6 +380,32 @@ test('rebuilds all shards once when subscriptions become invalid', async () => {
   await harness.close();
 });
 
+test('keeps valid shards and retries cleanup after a temporary service failure', async () => {
+  const harness = createHarness(2);
+  const points = ['ns=2;s=A', 'ns=2;s=B', 'ns=2;s=C'];
+  const replace = () => harness.input({ payload: points });
+  await replace();
+  const [healthy, expired] = harness.subscriptions.keys();
+  const remove = harness.client.deleteSubscription;
+  harness.client.validateSubscription = async () => { throw new Error('BadTimeout'); };
+  await assert.rejects(replace(), /BadTimeout/);
+  assert.deepEqual(harness.calls.delete, []);
+  harness.client.validateSubscription = async id => ({
+    valid: id !== expired, statusCode: id === expired ? 'BadSubscriptionIdInvalid' : 'Good',
+  });
+  harness.client.deleteSubscription = async () => { throw new Error('Delete subscription failed: BadTimeout'); };
+  await assert.rejects(replace(), /Delete subscription failed/);
+  assert.equal(harness.calls.create, 2);
+  assert.ok(harness.node.subscriptions.has(expired));
+  harness.client.deleteSubscription = remove;
+  await replace();
+  assert.deepEqual(harness.calls.delete, [expired]);
+  assert.ok(harness.subscriptions.has(healthy));
+  assert.equal(harness.calls.create, 3);
+  assert.equal(harness.node.monitored.size, 3);
+  await harness.close();
+});
+
 test('waits for in-flight reconciliation before cleaning up on close', async () => {
   const harness = createHarness(2);
   const createSubscription = harness.client.createSubscription;
@@ -553,4 +579,69 @@ test('automatic subscription failures reach Catch once and re-arm after successf
   harness.client.emit('state', { state: 'subscription-inactive' });
   await wait(900);
   assert.equal(harness.node.errors.length, 2);
+});
+
+test('connected cancels a slow recovery timer and pauses retries while client is backing off', async (t) => {
+  const harness = createHarness(2, { reconnectInterval: 10000 });
+  t.after(() => harness.close());
+  let clientState = 'connected';
+  harness.client.getState = () => ({ state: clientState });
+  await harness.input({ payload: [{ nodeId: 'ns=2;s=A' }] });
+
+  // Simulate a transient failure while connected that arms a long 10s retry timer.
+  const originalValidate = harness.client.validateSubscription;
+  harness.client.validateSubscription = async () => { throw new Error('BadTimeout'); };
+  harness.client.emit('state', { state: 'connected', reason: 'initial-check', sessionGeneration: 1 });
+  await wait(30);
+  assert.equal(harness.node.statuses.at(-1)?.text, 'waiting to recover');
+  assert.ok(harness.node.reconnectTimer);
+
+  // When the connection enters backoff, subscribe pauses its own retries and shows backoff.
+  clientState = 'backoff';
+  harness.client.emit('state', { state: 'backoff', connected: false });
+  assert.equal(harness.node.reconnectTimer, null);
+  assert.equal(harness.node.statuses.at(-1)?.text, 'backoff');
+  harness.client.emit('fault', new Error('OPCUA_CONNECTION_FAILED'));
+  assert.equal(harness.node.reconnectTimer, null);
+
+  // When connected returns, subscribe recovers immediately without waiting 10s.
+  harness.client.validateSubscription = originalValidate;
+  clientState = 'connected';
+  harness.subscriptions.clear();
+  harness.client.emit('state', { state: 'connected', reason: 'reconnected', sessionGeneration: 2 });
+  await wait(40);
+  assert.equal(harness.node.monitored.size, 1);
+  assert.equal(harness.node.statuses.at(-1)?.fill, 'green');
+});
+
+test('rebuilds subscriptions when server reports BadNoSubscription', async (t) => {
+  const harness = createHarness(2);
+  t.after(() => harness.close());
+  await harness.input({ payload: [{ nodeId: 'ns=2;s=A' }] });
+  const originalId = [...harness.subscriptions.keys()][0];
+  harness.client.validateSubscription = async (id) => ({
+    valid: id !== originalId,
+    statusCode: id === originalId ? 'BadNoSubscription' : 'Good',
+  });
+
+  harness.client.emit('state', { state: 'connected', reason: 'recheck', sessionGeneration: 2 });
+  await wait(30);
+
+  assert.equal(harness.subscriptions.size, 1);
+  assert.notEqual([...harness.subscriptions.keys()][0], originalId);
+  assert.equal(harness.node.monitored.size, 1);
+  assert.equal(harness.node.statuses.at(-1)?.fill, 'green');
+});
+
+test('emits queue_overflow diagnostic without throwing when native queue drops changes', async (t) => {
+  const harness = createHarness(10, { outputMode: 'single' });
+  t.after(() => harness.close());
+  await harness.input({ payload: [{ nodeId: 'ns=2;s=A' }] });
+  const subscription = [...harness.subscriptions.values()][0];
+  subscription.callback({
+    changes: [{ nodeId: 'ns=2;s=A', value: 1, statusCode: 'Good' }],
+    diagnostics: { queueDepth: 1, queueCapacity: 10, dropped: 3 },
+  });
+  assert(harness.node.diagnostics.some((msg) => msg.payload.event === 'queue_overflow' && msg.payload.dropped === 3));
+  assert.equal(harness.node.warnings.length, 1);
 });

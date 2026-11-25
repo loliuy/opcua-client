@@ -151,10 +151,10 @@ module.exports = function registerReadNode(RED) {
       }
     });
 
-    node.on('close', (removed, done) => {
+    node.on('close', async (removed, done) => {
       if (typeof removed === 'function') done = removed;
       closed = true;
-      consumer?.release();
+      await consumer?.release();
       done?.();
     });
   }

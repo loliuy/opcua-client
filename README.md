@@ -142,16 +142,14 @@ counts.
 
 `connectionUsage` reports the current Read/Write/Browse/Subscribe consumer count
 and types, each consumer's last use, aggregate operation counts, and connection
-idle time. It is diagnostic only: `automaticIdleDisconnect` is false. A deployed
-Connection therefore remains stable for subscriptions until its configuration
-node is closed; deleting the last referencing flow is visible as a zero consumer
-count but does not race an idle timer.
+idle time. When the last consumer closes, the Connection cancels pending reconnects
+and disconnects its client. Re-enabling a flow opens a connection on demand.
 
 ## Connection and subscription recovery
 
 The native client reports secure-channel, session, connectivity-check, and subscription-inactivity transitions to a JavaScript connection supervisor. Recoverable channel interruptions keep the native client alive. Terminal failures replace the native client and retry with exponential backoff, 20% jitter, and the configured maximum interval. Operations fail fast with `OPCUA_RECONNECTING` while the connection is unavailable instead of building an unbounded request queue.
 
-Subscribe nodes retain a desired point map independently from live server Subscriptions. After reconnection they serialize reconciliation, validate every old Subscription, rebuild the complete shard set when the server session was lost, and recreate each MonitoredItem once in service-sized batches. A recovery status message has `msg.opcua.operation = "subscription-status"`, `recovered`, `rebuilt`, `reason`, and `dataGapPossible`. `dataGapPossible` is true after a subscription rebuild because values may have changed while the server was unavailable.
+Subscribe nodes retain a desired point map independently from live server Subscriptions. After reconnection they serialize reconciliation, validate existing subscriptions and rebuild missing shards while retaining healthy ones. Temporary validation or deletion errors are retried on recovery. Monitored items are added in service-sized batches. A recovery status message has `msg.opcua.operation = "subscription-status"`, `recovered`, `rebuilt`, `reason`, and `dataGapPossible`. `dataGapPossible` is true after a subscription rebuild because values may have changed while the server was unavailable.
 
 Connection diagnostics also expose the current channel/session state and supervisor counters: client generation, reconnect attempts/successes, terminal replacements, and last recovery duration.
 
