@@ -134,6 +134,7 @@ module.exports = function registerConnectionNode(RED) {
     let nextConsumerId = 1;
     let lastUsedAt = null;
     let totalOperations = 0;
+    let closing = false;
 
     function markUsed(operation = 'unknown', consumer) {
       const now = Date.now();
@@ -168,7 +169,7 @@ module.exports = function registerConnectionNode(RED) {
         idleMs: lastUsedAt == null ? null : Math.max(0, Date.now() - lastUsedAt),
         totalOperations,
         operations: Object.fromEntries(operations),
-        automaticIdleDisconnect: false,
+        automaticIdleDisconnect: true,
       };
     }
 
@@ -215,6 +216,13 @@ module.exports = function registerConnectionNode(RED) {
           if (released) return;
           released = true;
           consumers.delete(consumer.id);
+          if (!consumers.size && !closing) {
+            const idleClient = node.client;
+            node.client = new OpcUaClient(options);
+            return idleClient.disconnect().catch((error) => {
+              node.warn(`OPC UA disconnect failed: ${error.message}`);
+            });
+          }
         },
       };
     };
@@ -242,6 +250,7 @@ module.exports = function registerConnectionNode(RED) {
         done = removed;
         removed = false;
       }
+      closing = true;
       registration.unregister();
       const cleanupResults = await Promise.allSettled(
         [...dependentCleanups].map(runDependentCleanup)

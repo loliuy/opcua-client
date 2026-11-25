@@ -33,14 +33,36 @@ module.exports = function registerReadNode(RED) {
     const consumer = node.connection?.registerConsumer?.('read', {
       nodeId: config.id, name: config.name,
     });
+    // Fixed-period sampling may discard redundant ticks; request/response flows
+    // must retain the original process-every-input behavior unless opted in.
+    const skipWhileBusy = config.inputPolicy === 'skip-while-busy';
+    let reading = false;
+    let closed = false;
+    let startedAt = 0;
+    let skipped = 0;
 
     node.on('input', async (msg, send, done) => {
+      if (closed) return done();
       if (!node.connection) {
         const error = new Error('OPCUA_CONNECTION_NOT_CONFIGURED');
         diagnostics.failure(error, send);
         return done(error);
       }
 
+      if (skipWhileBusy && reading) {
+        skipped++;
+        diagnostics.emit('warn', 'read_skipped_busy',
+          'Polling trigger skipped while the previous read is still running', {
+            skipped, durationMs: Math.round(performance.now() - startedAt),
+          }, send);
+        return done();
+      }
+
+      reading = true;
+      if (skipWhileBusy) {
+        startedAt = performance.now();
+        skipped = 0;
+      }
       diagnostics.beginInput();
       let inputError;
       try {
@@ -56,6 +78,10 @@ module.exports = function registerReadNode(RED) {
           points,
           Number(config.batchSize) || 500
         );
+        if (closed) return;
+        const polling = skipWhileBusy
+          ? { durationMs: Math.round(performance.now() - startedAt), skipped }
+          : undefined;
         const descriptors = new Map(points.map((point) => [point.nodeId, point]));
         const results = values.map((value) => ({
           ...descriptors.get(value.nodeId),
@@ -98,6 +124,7 @@ module.exports = function registerReadNode(RED) {
             total: results.length,
             good: results.filter((item) => item.statusCode === 'Good').length,
             resultDetail,
+            ...(polling ? { polling } : {}),
           };
           if (resultDetail === 'full') {
             msg.opcua.clientDiagnostics = node.connection.getDiagnostics?.() ||
@@ -106,22 +133,28 @@ module.exports = function registerReadNode(RED) {
           send(msg);
         }
 
-        node.status({ fill: failed ? 'yellow' : 'green', shape: failed ? 'ring' : 'dot',
-          text: `${results.length - failed}/${results.length} read` + (failed ? ` / ${failed} failed` : '') });
-        done();
+        const degraded = failed || polling?.skipped;
+        node.status({ fill: degraded ? 'yellow' : 'green', shape: degraded ? 'ring' : 'dot',
+          text: `${results.length - failed}/${results.length} read` +
+            (failed ? ` / ${failed} failed` : '') + (polling?.skipped ? ` / ${polling.skipped} skipped` : '') });
+        if (polling) diagnostics.emit('info', 'read_cycle_completed',
+          'OPC UA polling read completed', polling, send);
       } catch (error) {
+        if (closed) return;
         inputError = error;
         node.status({ fill: 'red', shape: 'ring', text: error.message });
         diagnostics.failure(error, send);
-        done(error);
       } finally {
+        reading = false;
         diagnostics.endInput(inputError);
+        done(inputError);
       }
     });
 
-    node.on('close', (removed, done) => {
+    node.on('close', async (removed, done) => {
       if (typeof removed === 'function') done = removed;
-      consumer?.release();
+      closed = true;
+      await consumer?.release();
       done?.();
     });
   }

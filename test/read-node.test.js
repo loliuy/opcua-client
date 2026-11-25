@@ -190,3 +190,128 @@ test('a successful input does not swallow a concurrent background connection fai
   assert.equal(harness.node.errors[0].error.code, 'BadConnectionRejected');
   harness.node.emit('close');
 });
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+test('fixed polling drops a burst while busy and reads fresh data on the next tick', async () => {
+  const harness = createHarness({ inputPolicy: 'skip-while-busy', pointList: JSON.stringify(detailedPoints) });
+  let status;
+  harness.node.status = (value) => { status = value; };
+  const readMany = harness.client.readMany;
+  let gate = deferred();
+  let calls = 0;
+  harness.client.readMany = async (points) => {
+    calls++;
+    await gate.promise;
+    return readMany(points);
+  };
+  const first = harness.input({ sequence: 1 });
+  await Promise.all(Array.from({ length: 10000 }, (_, index) => harness.input({ sequence: index + 2 })));
+  assert.equal(calls, 1, 'no redundant reads reach the client');
+  assert.equal(harness.sent.filter((msg) => !Array.isArray(msg)).length, 0);
+  const warnings = harness.sent.filter(Array.isArray).map((msg) => msg[1].payload);
+  assert.equal(warnings.length, 1, 'busy warnings are throttled, not one per tick');
+  assert.equal(warnings[0].event, 'read_skipped_busy');
+  assert.equal(warnings[0].skipped, 1);
+  assert.equal(harness.node.errors.length, 0, 'skips are not Catch errors');
+  gate.resolve();
+  await first;
+  const output = harness.sent.find((msg) => !Array.isArray(msg));
+  assert.equal(output.sequence, 1);
+  assert.equal(output.opcua.polling.skipped, 10000);
+  assert(output.opcua.polling.durationMs >= 0);
+  assert.equal(status.fill, 'yellow');
+  assert.match(status.text, /10000 skipped/);
+  await new Promise(setImmediate);
+  assert.equal(calls, 1, 'there is no catch-up read');
+  gate = deferred();
+  const next = harness.input({ sequence: 10002 });
+  assert.equal(calls, 2);
+  gate.resolve();
+  await next;
+  const outputs = harness.sent.filter((msg) => !Array.isArray(msg));
+  assert.equal(outputs[1].sequence, 10002);
+  assert.equal(outputs[1].opcua.polling.skipped, 0);
+  assert.equal(status.fill, 'green');
+});
+
+test('default and explicit all policies preserve every dynamic read input', async () => {
+  for (const inputPolicy of [undefined, 'all']) {
+    const harness = createHarness({ inputPolicy });
+    const readMany = harness.client.readMany;
+    const gate = deferred();
+    const received = [];
+    harness.client.readMany = async (points) => {
+      received.push(points[0].nodeId);
+      await gate.promise;
+      return readMany(points);
+    };
+    const messages = Array.from({ length: 25 }, (_, index) => ({ nodeId: `ns=2;s=P${index}` }));
+    const pending = messages.map((msg) => harness.input(msg));
+    assert.deepEqual(received, messages.map((msg) => msg.nodeId));
+    gate.resolve();
+    await Promise.all(pending);
+    assert.equal(harness.sent.length, 25);
+    assert(harness.sent.every((msg) => !Array.isArray(msg) && !msg.opcua.polling));
+  }
+});
+
+test('polling guard releases after timeout and preserves the real Catch error', async () => {
+  const harness = createHarness({ inputPolicy: 'skip-while-busy', nodeId: 'ns=2;s=A' });
+  const readMany = harness.client.readMany;
+  const gate = deferred();
+  harness.client.readMany = () => gate.promise;
+  const error = new Error('Batch read failed: BadTimeout');
+  const failed = assert.rejects(harness.input({}), error);
+  await harness.input({});
+  gate.reject(error);
+  await failed;
+  assert(harness.sent.some((msg) => Array.isArray(msg) &&
+    msg[1].payload.event === 'read_failed' && msg[1].payload.statusCode === 'BadTimeout'));
+  harness.client.readMany = readMany;
+  await harness.input({});
+  assert.equal(harness.sent.filter((msg) => !Array.isArray(msg)).length, 1);
+});
+
+test('polling guard releases before done can trigger the next read', async () => {
+  const harness = createHarness({ inputPolicy: 'skip-while-busy', nodeId: 'ns=2;s=A' });
+  let next;
+  await new Promise((resolve, reject) => {
+    harness.node.emit('input', {}, (msg) => harness.sent.push(msg), (error) => {
+      if (error) return reject(error);
+      next = harness.input({});
+      resolve();
+    });
+  });
+  await next;
+  assert.equal(harness.sent.filter((msg) => !Array.isArray(msg)).length, 2);
+});
+
+test('closing a busy Read node prevents late data/errors and completes pending inputs once', async () => {
+  for (const fails of [false, true]) {
+    const harness = createHarness({ inputPolicy: 'skip-while-busy', nodeId: 'ns=2;s=A' });
+    const gate = deferred();
+    harness.client.readMany = () => gate.promise;
+    let completed = 0;
+    const pending = new Promise((resolve) => {
+      harness.node.emit('input', {}, (msg) => harness.sent.push(msg), (error) => {
+        assert.equal(error, undefined);
+        completed++;
+        resolve();
+      });
+    });
+    harness.node.emit('close');
+    if (fails) gate.reject(new Error('BadTimeout'));
+    else gate.resolve([{ nodeId: 'ns=2;s=A', value: 42, statusCode: 'Good' }]);
+    await pending;
+    await harness.input({});
+    assert.equal(completed, 1);
+    assert.deepEqual(harness.sent, []);
+    assert.deepEqual(harness.node.errors, []);
+  }
+});

@@ -204,8 +204,8 @@ module.exports = function registerSubscribeNode(RED) {
       return output;
     }
 
-    function updateQueueWarning(diagnostics) {
-      const dropped = Number(diagnostics.dropped) || 0;
+    function updateQueueWarning(queueDiagnostics) {
+      const dropped = Number(queueDiagnostics.dropped) || 0;
       if (dropped > node.lastDropped) {
         diagnostics.emit('warn', 'queue_overflow', 'OPC UA notification queue dropped changes', { dropped });
         node.warn(`OPC UA notification queue dropped ${dropped - node.lastDropped} change(s); total ${dropped}`);
@@ -275,7 +275,7 @@ module.exports = function registerSubscribeNode(RED) {
     }
 
     function onNativeBatch(record, batch) {
-      if (node.closing || !record.id || !node.subscriptions.has(record.id)) return;
+      if (node.closing || node.subscriptions.get(record.id) !== record) return;
       const queueDiagnostics = batch.diagnostics || {};
       node.subscriptionDiagnostics.set(record.id, queueDiagnostics);
       const sourceChanges = batch.changes || [];
@@ -343,6 +343,7 @@ module.exports = function registerSubscribeNode(RED) {
         overflowPolicy: config.overflowPolicy || 'drop-oldest',
       }, (batch) => onNativeBatch(record, batch));
       record.id = result.subscriptionId;
+      record.clientHandle = node.connection.client.handle;
       record.revisedPublishingInterval = result.revisedPublishingInterval ?? null;
       record.revisedLifetimeCount = result.revisedLifetimeCount ?? null;
       record.revisedMaxKeepAliveCount = result.revisedMaxKeepAliveCount ?? null;
@@ -463,37 +464,49 @@ module.exports = function registerSubscribeNode(RED) {
       );
       for (const record of empty) {
         if (node.subscriptions.size <= 1 && node.desired.size > 0) break;
-        node.subscriptions.delete(record.id);
-        node.subscriptionDiagnostics.delete(record.id);
-        await node.connection.client.deleteSubscription(record.id);
+        await deleteRecord(record);
       }
     }
 
-    async function clearSubscriptions(keepDesired = false, ignoreErrors = false) {
+    async function deleteRecord(record) {
+      const client = node.connection.client;
+      if (record.clientHandle === client.handle) {
+        await client.deleteSubscription(record.id);
+      }
+      for (const nodeId of record.monitored.keys()) node.monitored.delete(nodeId);
+      node.subscriptionDiagnostics.delete(record.id);
+      node.subscriptions.delete(record.id);
+    }
+
+    async function clearSubscriptions(keepDesired = false) {
       if (!keepDesired) {
         node.desired.clear();
         node.failed.clear();
       }
       discardPendingChanges();
-      const records = [...node.subscriptions.values()];
-      node.subscriptions.clear();
-      node.monitored.clear();
-      node.subscriptionDiagnostics.clear();
-      const results = await Promise.allSettled(
-        records.map((record) => node.connection.client.deleteSubscription(record.id))
-      );
-      if (!ignoreErrors) {
-        const rejected = results.find((result) => result.status === 'rejected');
-        if (rejected) throw rejected.reason;
-      }
+      for (const record of node.subscriptions.values()) await deleteRecord(record);
     }
 
-    async function validateSubscriptions() {
+    const INVALID_SUBSCRIPTION_CODES = new Set([
+      'BadSubscriptionIdInvalid',
+      'BadNoSubscription',
+    ]);
+
+    async function removeInvalidSubscriptions() {
+      let removed = false;
       for (const record of node.subscriptions.values()) {
-        const validation = await node.connection.client.validateSubscription(record.id);
-        if (!validation.valid) return false;
+        const client = node.connection.client;
+        if (record.clientHandle === client.handle) {
+          const validation = await client.validateSubscription(record.id);
+          if (validation.valid) continue;
+          if (!INVALID_SUBSCRIPTION_CODES.has(validation.statusCode)) {
+            throw new Error(`Validate subscription failed: ${validation.statusCode}`);
+          }
+        }
+        await deleteRecord(record);
+        removed = true;
       }
-      return true;
+      return removed;
     }
 
     function failurePayload() {
@@ -551,13 +564,9 @@ module.exports = function registerSubscribeNode(RED) {
 
       let rebuilt = false;
       if (node.subscriptions.size) {
-        let valid = false;
-        try { valid = await validateSubscriptions(); } catch (error) {
+        try { rebuilt = await removeInvalidSubscriptions(); } catch (error) {
           diagnostics.failure(error, undefined, 'subscription_validation_failed', true);
-        }
-        if (!valid) {
-          await clearSubscriptions(true, true);
-          rebuilt = true;
+          throw error;
         }
       }
 
@@ -629,16 +638,34 @@ module.exports = function registerSubscribeNode(RED) {
       return run;
     }
 
+    function clearReconnectTimer() {
+      if (node.reconnectTimer) clearTimeout(node.reconnectTimer);
+      node.reconnectTimer = null;
+    }
+
+    function isClientReconnecting() {
+      const state = node.connection?.client?.getState?.()?.state;
+      return ['reconnecting', 'backoff', 'failed', 'replacing'].includes(state);
+    }
+
     function scheduleReconnect(reason = 'connection-state', immediate = false) {
-      if (node.closing || node.reconnectTimer) return;
+      if (node.closing) return;
+      if (!immediate && isClientReconnecting()) return;
+      if (node.reconnectTimer) {
+        if (!immediate) return;
+        clearReconnectTimer();
+      }
       const base = Math.max(100, Number(config.reconnectInterval) || 5000);
       const delay = immediate ? 0 : Math.min(30000, base * (2 ** node.reconcileAttempt));
-      node.reconcileAttempt += 1;
+      if (immediate) node.reconcileAttempt = 0;
+      else node.reconcileAttempt += 1;
       node.reconnectTimer = setTimeout(async () => {
         node.reconnectTimer = null;
+        if (node.closing || isClientReconnecting()) return;
         try {
           await runSerialized(() => reconcileSubscriptions(reason));
         } catch (error) {
+          if (node.closing || isClientReconnecting()) return;
           diagnostics.failure(error, undefined, 'subscription_recovery_failed', true);
           diagnostics.backgroundFailure(error, 'subscription_recovery_failed');
           node.status({ fill: 'yellow', shape: 'ring', text: 'waiting to recover' });
@@ -648,7 +675,9 @@ module.exports = function registerSubscribeNode(RED) {
       node.reconnectTimer.unref?.();
     }
 
-    const onFault = () => scheduleReconnect('service-fault');
+    const onFault = () => {
+      if (!isClientReconnecting()) scheduleReconnect('service-fault');
+    };
     const onState = (state) => {
       if (!state || node.closing) return;
       if (Number(state.sessionGeneration) > 0) {
@@ -662,6 +691,7 @@ module.exports = function registerSubscribeNode(RED) {
         node.status({ fill: 'yellow', shape: 'ring', text: 'subscription inactive' });
         scheduleReconnect('subscription-inactive');
       } else if (['reconnecting', 'backoff', 'failed'].includes(state.state)) {
+        clearReconnectTimer();
         node.status({ fill: 'yellow', shape: 'ring', text: state.state });
       }
     };
@@ -750,8 +780,11 @@ module.exports = function registerSubscribeNode(RED) {
       node.connection?.client.off('state', onState);
       node.desired.clear();
       node.failed.clear();
-      consumer?.release();
-      await runSerialized(() => clearSubscriptions());
+      try {
+        await runSerialized(() => clearSubscriptions());
+      } finally {
+        await consumer?.release();
+      }
     }
 
     const runCleanup = node.connection?.registerDependentCleanup?.(cleanupSubscription) ||

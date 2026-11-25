@@ -61,9 +61,9 @@ module.exports = function registerWriteNode(RED) {
       }
     });
 
-    node.on('close', (removed, done) => {
+    node.on('close', async (removed, done) => {
       if (typeof removed === 'function') done = removed;
-      consumer?.release();
+      await consumer?.release();
       done?.();
     });
   }

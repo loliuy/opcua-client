@@ -1,6 +1,6 @@
 {
   "name": "@tier0/opcua-client",
-  "version": "0.6.4",
+  "version": "0.6.8",
   "description": "High-scale OPC UA client nodes for Node-RED powered by open62541",
   "license": "Apache-2.0",
   "repository": {
@@ -31,6 +31,7 @@
     "build": "node-gyp rebuild",
     "clean": "node-gyp clean",
     "test": "node --test test/*.test.js",
+    "test:read-polling": "node test/read-polling.integration.js",
     "test:native": "node test/native.integration.js && node test/native.queue.integration.js && node test/native.command-queue.integration.js && node test/reconnect.integration.js",
     "test:reconnect": "node test/reconnect.integration.js",
     "test:secure": "node test/secure.integration.js",

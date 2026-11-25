@@ -422,7 +422,7 @@ async function main() {
       ? finalRead?.clientDiagnostics
       : finalWrite?.clientDiagnostics;
     assert.equal(nodeRedDiagnostics.connectionUsage.consumerCount, 5);
-    assert.equal(nodeRedDiagnostics.connectionUsage.automaticIdleDisconnect, false);
+    assert.equal(nodeRedDiagnostics.connectionUsage.automaticIdleDisconnect, true);
     setMemoryPhase('clear');
     await jsonRequest(`${adminUrl}${routeRoot}/clear`, 'POST', {});
     const endSample = processSample(nodeRedPid);

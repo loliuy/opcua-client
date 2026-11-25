@@ -87,6 +87,37 @@ Parsed NodeIds are cached per connection in native code. The default capacity is
 
 ## Native client ownership and command queue
 
+### Fixed-period reads
+
+Read defaults to `inputPolicy: "all"` and continues to execute every input.
+For a fixed point list sampled by an Inject timer, opt into
+`inputPolicy: "skip-while-busy"` (**While busy → Skip polling triggers**).
+Only one complete read round, including connect and every service batch, runs
+per Read node. Extra ticks complete without data output and are discarded;
+the next timer tick after completion starts a fresh read. No catch-up queue
+or immediate retry is created. Use the default for dynamic point lists or
+request/response flows where every input must execute.
+
+Protected batch outputs add `msg.opcua.polling: { durationMs, skipped }` for
+that round. The node status also shows skipped ticks in yellow after the read.
+Output 2 reports `read_skipped_busy` and `read_cycle_completed`
+with the same metrics, throttled to one event per type every 30 seconds.
+Skipped ticks do not raise Catch errors; real read failures still do.
+For single/split output, use output 2 for polling metrics.
+
+This prevents stale polling work accumulating; it does not increase server
+capacity. Persistent skips mean the interval or point load must be adjusted.
+Queued timer ticks do not preserve historical samples: a delayed Read obtains
+the value when it is actually served, not the value at the original tick.
+If every sampling instant or intermediate change must be retained, the server's
+sampling/history capabilities and end-to-end buffering need separate design.
+The guard is per Read node, so several nodes sharing a connection can still
+overload it. Keep the bounded native queue as a final safeguard. A server
+`Batch read failed: BadTimeout` is distinct from a local queue timeout and
+still requires checking server capacity, batch size and network conditions.
+Native queue depth excludes work waiting in JavaScript/libuv; a shallow native
+queue therefore does not prove that periodic reads are keeping up.
+
 Each Connection owns one native C++ thread. That thread creates and closes the `UA_Client`, executes Connect, Browse, Read, Write, and Subscription commands, and runs `UA_Client_run_iterate`. Node.js async workers only submit commands and wait for their results, so concurrent Flow messages never access one open62541 client from multiple threads.
 
 The native command queue defaults to 256 pending commands and is configurable as `Command queue` under advanced Connection settings. Queue capacity is hard: overload is rejected with an explicit error. A command that remains queued longer than the configured OPC UA request timeout is removed safely; an already-running service call is allowed to finish under open62541's request timeout. Closing a Connection stops accepting work, rejects pending commands, and performs OPC UA cleanup on the owner thread.
@@ -111,16 +142,14 @@ counts.
 
 `connectionUsage` reports the current Read/Write/Browse/Subscribe consumer count
 and types, each consumer's last use, aggregate operation counts, and connection
-idle time. It is diagnostic only: `automaticIdleDisconnect` is false. A deployed
-Connection therefore remains stable for subscriptions until its configuration
-node is closed; deleting the last referencing flow is visible as a zero consumer
-count but does not race an idle timer.
+idle time. When the last consumer closes, the Connection cancels pending reconnects
+and disconnects its client. Re-enabling a flow opens a connection on demand.
 
 ## Connection and subscription recovery
 
 The native client reports secure-channel, session, connectivity-check, and subscription-inactivity transitions to a JavaScript connection supervisor. Recoverable channel interruptions keep the native client alive. Terminal failures replace the native client and retry with exponential backoff, 20% jitter, and the configured maximum interval. Operations fail fast with `OPCUA_RECONNECTING` while the connection is unavailable instead of building an unbounded request queue.
 
-Subscribe nodes retain a desired point map independently from live server Subscriptions. After reconnection they serialize reconciliation, validate every old Subscription, rebuild the complete shard set when the server session was lost, and recreate each MonitoredItem once in service-sized batches. A recovery status message has `msg.opcua.operation = "subscription-status"`, `recovered`, `rebuilt`, `reason`, and `dataGapPossible`. `dataGapPossible` is true after a subscription rebuild because values may have changed while the server was unavailable.
+Subscribe nodes retain a desired point map independently from live server Subscriptions. After reconnection they serialize reconciliation, validate existing subscriptions and rebuild missing shards while retaining healthy ones. Temporary validation or deletion errors are retried on recovery. Monitored items are added in service-sized batches. A recovery status message has `msg.opcua.operation = "subscription-status"`, `recovered`, `rebuilt`, `reason`, and `dataGapPossible`. `dataGapPossible` is true after a subscription rebuild because values may have changed while the server was unavailable.
 
 Connection diagnostics also expose the current channel/session state and supervisor counters: client generation, reconnect attempts/successes, terminal replacements, and last recovery duration.
 
