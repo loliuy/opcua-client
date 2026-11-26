@@ -64,6 +64,7 @@
     </ul>
     <p>Int64/UInt64 超出 JavaScript 安全整数范围时以十进制字符串输出，避免累计量和计数器精度丢失。</p>
     <p>大点表会按照 Batch size 和服务器 OperationLimits 自动拆分为批量服务请求，不会逐点建立连接。</p>
+    <p>批读超时时，输出 2 的 read_failed 包含当前批次序号 batchNumber、请求数 batchRequested、SDK 解码的点结果数 batchReturned、前面批次返回数 completedReturned 和其中的好点数 completedGood，以及尚未请求的点数 unattempted。responseHeaderObserved 表示客户端看到了响应头中的时间戳或请求句柄。一次超时结束本轮，输出 1 不发送这轮数据。</p>
     <p><b>While busy</b> 默认处理每条输入。固定点表的周期采集可选择 <b>Skip polling triggers</b>：上一整轮读取（含连接和所有批次）未完成时跳过新触发，不排队、不补读，下一次定时触发再读取。被跳过的输入不会输出数据，但仍正常完成；勿用于必须逐条执行的请求或动态点表。</p>
     <p>此模式下，批量输出的 <code>msg.opcua.polling</code> 包含本轮 <code>durationMs</code> 和 <code>skipped</code>。输出 2 的 <code>read_skipped_busy</code> 与 <code>read_cycle_completed</code> 同样包含这些字段，并遵循 30 秒限频；跳过不是 Catch 错误。持续跳过时应延长采集周期或减少点位负载。此保护只作用于当前 Read 节点，其他节点共享连接的负载仍需合并评估。</p>
   </section>
@@ -87,6 +88,7 @@
     </ul>
     <p>Int64/UInt64 values outside the JavaScript safe-integer range are emitted as decimal strings to preserve exact counters and totals.</p>
     <p>Large point lists are split according to Batch size and server OperationLimits. The node does not create one connection per point.</p>
+    <p>On a batch read timeout, output 2 reports read_failed with batchNumber (1-based), batchRequested and batchReturned (decoded item results), completedReturned and completedGood (earlier batches), and unattempted (remaining points). responseHeaderObserved indicates a timestamp or request handle in the response header. The round stops without data on output 1.</p>
     <p><b>While busy</b> defaults to processing every input. For a fixed point list sampled periodically, select <b>Skip polling triggers</b>: while a complete read round (including connection and all batches) is running, new triggers are skipped without queuing or catch-up. Reading resumes on the next timer tick. Skipped inputs complete normally without data output. Do not use this mode for requests or dynamic point lists that must each execute.</p>
     <p>In this mode, batch output <code>msg.opcua.polling</code> includes this round's <code>durationMs</code> and <code>skipped</code>. Output 2 events <code>read_skipped_busy</code> and <code>read_cycle_completed</code> include the same fields, subject to the 30-second throttle. Skips are not Catch errors. Persistent skips call for a longer interval or lower point load. This guard applies to this Read node only; other nodes sharing the connection still contribute load.</p>
   </section>

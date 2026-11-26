@@ -1496,8 +1496,22 @@ class ReadManyWorker : public ClientCommandWorker {
       SetError("Batch read failed: " + StatusName(response_.responseHeader.serviceResult));
     }
   }
+  void OnError(const Napi::Error& error) override {
+    if (response_.responseHeader.serviceResult == UA_STATUSCODE_BADTIMEOUT) {
+      Napi::Object details = Napi::Object::New(Env());
+      details.Set("batchReturned", static_cast<double>(response_.resultsSize));
+      // A server timestamp or echoed handle is evidence of a decoded reply.
+      // Empty headers alone do not tell us what happened on the wire.
+      details.Set("responseHeaderObserved", response_.responseHeader.timestamp != 0 ||
+                  response_.responseHeader.requestHandle != 0);
+      error.Value().Set("readTimeout", details);
+    }
+    PromiseWorker::OnError(error);
+  }
   void OnOK() override {
     Napi::Array output = Napi::Array::New(Env(), inputs_.size());
+    output.DefineProperty(Napi::PropertyDescriptor::Value(
+        "returnedCount", Napi::Number::New(Env(), response_.resultsSize), napi_default));
     for (size_t index = 0; index < inputs_.size(); ++index) {
       Napi::Object item = Napi::Object::New(Env());
       item.Set("nodeId", inputs_[index].node_id);

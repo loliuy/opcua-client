@@ -4,6 +4,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const registerReadNode = require('../nodes/read');
+const { OpcUaClient } = require('../lib/client');
+const { setAddonForTests, resetAddonForTests } = require('../lib/native');
 
 function createHarness(config = {}) {
   const diagnostics = { commandQueue: { depth: 0 } };
@@ -70,6 +72,40 @@ const detailedPoints = [
     accessLevel: 3, samplingInterval: 1000, queueSize: 10, discardOldest: true,
   },
 ];
+
+test('Read reports earlier results, decoded timeout results and untouched points on port 2', async (t) => {
+  let calls = 0;
+  const timeout = new Error('Batch read failed: BadTimeout');
+  timeout.readTimeout = { batchReturned: 0, responseHeaderObserved: true };
+  setAddonForTests({
+    connectAsync: async () => 7,
+    disconnectAsync: async () => {},
+    readManyAsync: async (_handle, points) => {
+      if (++calls === 2) throw timeout;
+      return points.map(({ nodeId }, i) => ({ nodeId, statusCode: i ? 'BadTimeout' : 'Good' }));
+    },
+  });
+  const client = new OpcUaClient({ endpoint: 'opc.tcp://test:4840' });
+  t.after(async () => {
+    try { await client.disconnect(); } finally { resetAddonForTests(); }
+  });
+  const harness = createHarness({ batchSize: 2 });
+  harness.client.readMany = client.readMany.bind(client);
+  const items = Array.from({ length: 5 }, (_, i) => ({ nodeId: 'ns=2;i=' + i }));
+  await assert.rejects(harness.input({ items }), /Batch read failed: BadTimeout/);
+  assert.equal(calls, 2);
+  assert.equal(harness.sent.length, 1);
+  const [data, diagnostic] = harness.sent[0];
+  assert.equal(data, null);
+  const { time, ...payload } = diagnostic.payload;
+  assert.deepEqual(payload, {
+    level: 'error', event: 'read_failed', message: 'OPC UA read failed',
+    nodeId: undefined, connectionId: 'connection-1', operation: 'read', retrying: false,
+    statusCode: 'BadTimeout', total: 5, batchNumber: 2, batchRequested: 2,
+    batchReturned: 0, completedReturned: 2, completedGood: 1, unattempted: 1,
+    responseHeaderObserved: true,
+  });
+});
 
 test('compact batch omits stable Browse, subscription, and diagnostic metadata', async () => {
   const harness = createHarness({
